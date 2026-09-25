@@ -68,8 +68,12 @@ HOST_ID=$(find_or_create_sim "bakarat-host")
 GUEST_ID=$(find_or_create_sim "bakarat-guest")
 log "bakarat-host  = $HOST_ID"
 log "bakarat-guest = $GUEST_ID"
+# UN SEUL simulateur booté à la fois hors duel : deux sims + diskimagesiod
+# saturent le Mac (load > 40, runners XCUITest « timed out while preparing »,
+# vécu le 2026-09-25). Le guest n'est booté que pour le duel, puis éteint.
+xcrun simctl shutdown "$GUEST_ID" >/dev/null 2>&1 || true
 xcrun simctl bootstatus "$HOST_ID" -b >/dev/null 2>&1 || true
-xcrun simctl bootstatus "$GUEST_ID" -b >/dev/null 2>&1 || true
+sleep 20   # laisse SpringBoard finir de démarrer avant le premier runner
 
 # ── Journal QA de l'app (Documents/qa.log) ───────────────────────────────────
 # Un XCUITest ne peut pas lire le container de l'app : c'est le runner qui va
@@ -197,6 +201,8 @@ fi
 # l'hôte pour laisser le salon QATEST exister avant le join.
 if want duel; then
   log "duel : hôte (bakarat-host) + guest (bakarat-guest, +8s)"
+  xcrun simctl bootstatus "$GUEST_ID" -b >/dev/null 2>&1 || true
+  sleep 30   # sim guest chaud avant de lancer les deux runners
   (
     TEST_RUNNER_BAKARAT_QA_PASSWORD="${BAKARAT_QA_PASSWORD:-}" \
       run_suite "$HOST_ID" "duel-host" -only-testing:BakaratUITests/BakaratDuelHostUITests
@@ -321,6 +327,9 @@ log "terminé → $OUT/SUMMARY.md"
 # qui tombe ne doit pas faire tomber la loop. ────────────────────────────────
 if [ "$NO_JUDGE" -eq 0 ] && command -v claude >/dev/null 2>&1; then
   log "juge…"
+# Le guest n'a plus rien à faire : on l'éteint pour rendre le Mac au juge et au dev.
+xcrun simctl shutdown "$GUEST_ID" >/dev/null 2>&1 || true
+
   python3 "$REPO/scripts/online-judge.py" "$OUT" >> "$OUT/judge.log" 2>&1 \
     && log "juge → audits/online/" \
     || log "juge KO (voir $OUT/judge.log)"
