@@ -9,7 +9,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var auth: AuthService
-    @AppStorage("hasSeenOnboarding") private var hasSeenOnboarding: Bool = false
+    @AppStorage("hasSeenOnboarding") private var hasSeenOnboarding: Bool = QALaunchOptions.isActive
     @State private var showOnboarding: Bool = false
 
     var body: some View {

@@ -1,2 +1,5 @@
 .Rhistory
 .DS_Store
+
+# Runs locaux de la loop online (captures, xcresult, logs) : le juge publie registry.json / OPEN.md / <date>.md via l'API
+audits/online/20*/

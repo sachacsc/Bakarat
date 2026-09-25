@@ -31,7 +31,7 @@ Game rules are documented in [`RULES.md`](RULES.md) — read it once before work
 
 - **Frontend** : vanilla JS (ES modules) + CSS, no framework
 - **Auth + DB + Storage** : Supabase (Postgres, Auth, Realtime, Storage)
-- **Realtime multiplayer** : PeerJS (WebRTC P2P, host = phone) — will likely migrate to Supabase Realtime later
+- **Realtime multiplayer (iOS)** : « salle durable » — état versionné dans Postgres (`online_rooms`), RPC `room_*`, Realtime = ping + `room_get`. Voir `docs/PLAN_ONLINE_V2.md`. (Le web utilise encore PeerJS : legacy, incompatible avec l'iOS.)
 - **Card assets** : `Xadeck/xCards` via jsdelivr CDN (faces + back, all 750×1050 / 5:7)
 - **PWA** : `manifest.json` + `sw.js` (service worker, network-first HTML, cache-first assets)
 
@@ -144,26 +144,39 @@ RLS everywhere. SELECTs use a `public.my_game_ids()` SECURITY DEFINER helper to 
 
 **Storage bucket** `avatars/` : public read, owner-only write at `avatars/{user_id}/*`.
 
-## Online flow (PeerJS)
+## Online flow (iOS, salle durable — 2026-09-25)
 
 ```
-Host clicks "Créer une partie"
-  → onlineCreateStart() → onlineHostStart()
-  → new Peer(roomCodeToPeerId(generatedCode), ICE_SERVERS)
-  → on 'open' : lobby view shown, code displayed
-
-Guest clicks "Rejoindre" → enters code
-  → onlineJoinStart() → renders code input form
-  → onlineConfirmName() → onlineGuestStart() → new Peer + connect to host
-
-Host receives connection
-  → handleHostMessage (handshake, then game messages)
-  → maintains game state, broadcasts snapshots to each guest
-  → saveOnlineState() persists game in localStorage after every broadcast
-    (used for the "interrupted game" banner on reload)
+Hôte : createRoom → RPC room_create (code 4 chars, state = OnlineRoom seed) → transport.open(code)
+Guest : joinRoom  → RPC room_join → transport.open(code)
+transport.open : channel Realtime `room:CODE` (postgres_changes UPDATE = PING, jamais décodé)
+                 + poll room_heartbeat (2 s lobby / 5 s partie) → room_get si version a bougé
+Hôte anime : hostDriverTask = boucle de PAS IDEMPOTENTS (attente → relecture → précondition → room_publish CAS)
+Guest annonce : RPC room_submit (le serveur valide siège/cartes/phase, fusionne avec les publish de l'hôte)
+Bail d'hôte 15 s renouvelé par le heartbeat ; expiré → plus petit seat connecté fait room_claim_host
+Présence : last_seen_at par membre ; connected = silence < 20 s ; forfait seulement après 60 s ET si le siège bloque
+Quitter = geste explicite (bouton) → room_leave ; jamais implicite (onDisappear, onglet, arrière-plan)
+scenePhase .active / NWPathMonitor → transport.resync()
 ```
 
-Pseudo is taken from `authProfile.display_name` (no manual prompt). The host's peer ID is derived from the room code (`ONLINE_PEER_PREFIX + code`), which is stable across sessions — that's how the resume banner works.
+Pourquoi : audit `docs/AUDIT_CONNECTIVITE_2026-09-25.md` (hôte en RAM + broadcast sans ack = accros).
+Fichiers : `Core/Online/Service/RoomTransport.swift` (RPC, ping, poll, chaos, journal),
+`OnlineGameService.swift` (règles + tempo + bail + présence), migration `supabase/migrations/20260925100000_online_rooms.sql`.
+`room_get` **expurge** : un guest ne reçoit que sa main (`hands` à 0 ou 1 clé) et `pendingFlop/Turns/Rivers/burns = []`
+hors `mancheEnd` — aucune vue guest ne doit dépendre de ces champs.
+
+### Hooks QA (DEBUG, `Core/QA/QALaunchOptions.swift`)
+
+`-autoLoginEmail X -autoLoginPassword Y` · `-qaRoomCode ABCD` · `-autoCreateRoom` · `-autoJoinCode ABCD` ·
+`-qaBots N` (+ `-qaPassword` ou env `BAKARAT_QA_PASSWORD`) · `-autoStartAt N` · `-chaos guest-blip-10s|host-lock-30s|drop-30pct|slow-3s|double-host`.
+Journal : `Documents/qa.log` (`QALog`), lisible via `xcrun simctl get_app_container <sim> com.sacha.Bakarat data`.
+Comptes QA et secrets : `docs/INFRA.md`.
+
+### Loops de test
+
+`scripts/online-loop.sh` (launchd `com.bakarat.online-loop`, 15:00) : tests règles + protocole live (`BakaratTests`),
+tour avec bots (`BakaratTourUITests`, light/dark), duel deux simulateurs (`scripts/duel.sh`), export
+`audits/online/<date>/`, juge `scripts/online-judge.py` → `audits/online/OPEN.md` (registre `B-`/`C-`).
 
 ## Counter flow
 
@@ -186,7 +199,8 @@ Pseudo is taken from `authProfile.display_name` (no manual prompt). The host's p
 ## Common pitfalls
 
 - **`state.players` is the active counter's players (by reference)** : mutating `state.players[i].name = ...` directly affects `state.counters[i].players[i].name`. But `state.players = [...]` (reassignment) BREAKS the link — `save()` then re-syncs explicitly.
-- **PeerJS sessions don't survive page reloads.** The `online` runtime state is in memory only. The resume banner only restores the host's game state, not the WebRTC connection — guests have to rejoin.
+- **iOS : ne jamais réintroduire un `leave` implicite** (`onDisappear`, changement d'onglet) ni un `signInAnonymously` en fallback : c'étaient les accros de mai 2026. Le web (PeerJS) est legacy.
+- **Supabase plan gratuit = pause après 7 jours sans requête** → `scripts/supabase-keepalive.sh` (launchd) ; vérifier `status` via l'API de gestion avant de chercher un bug réseau.
 - **RLS policies that reference each other will recurse.** Always go through a SECURITY DEFINER function (like `my_game_ids()`).
 - **`enable_confirmations = false`** in `supabase/config.toml` — signups create an immediate session. If you ever flip it on, the signup UX needs an "email confirmation pending" screen.
 - **Service worker caches stale HTML occasionally.** When debugging UI issues, force-refresh (`Cmd+Shift+R`) before assuming the code is wrong.

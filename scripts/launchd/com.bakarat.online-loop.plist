@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- La loop Online v2 quotidienne (T35, 2026-09-25) : unitaires + tour
+         (bots in-app, light/dark) + duel (deux simulateurs, hôte/invité),
+         exporte captures + logs + summary.json dans audits/online/<date>/ puis
+         appelle le juge (T36) → audits/online/OPEN.md sur GitHub. Ce run
+         compte comme keep-alive Supabase (cf docs/INFRA.md).
+         En JOURNÉE (le Mac dort la nuit ; caffeinate nocturne = batterie,
+         leçon Zmeo 2026-08-09). 15:00 Paris, APRÈS le Grand Tour Zmeo de
+         13:00 (ne pas chevaucher : CPU + simulateurs). ~30-60 min sur ses
+         propres simulateurs dédiés (bakarat-host, bakarat-guest) et sa propre
+         DerivedData (~/Library/Caches/bakarat-loop-dd, jamais /tmp).
+         NE PAS CHARGER automatiquement — geste owner explicite :
+         cp scripts/launchd/com.bakarat.online-loop.plist ~/Library/LaunchAgents/
+         launchctl load ~/Library/LaunchAgents/com.bakarat.online-loop.plist -->
+    <key>Label</key>
+    <string>com.bakarat.online-loop</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>cd "$HOME/Developer/Baccarat" &amp;&amp; exec ./scripts/online-loop.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict><key>Hour</key><integer>15</integer><key>Minute</key><integer>0</integer></dict>
+    <key>StandardOutPath</key>
+    <string>/Users/sacha/Library/Logs/bakarat-online-loop.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sacha/Library/Logs/bakarat-online-loop.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+</dict>
+</plist>

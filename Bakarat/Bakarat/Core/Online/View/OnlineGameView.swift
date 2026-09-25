@@ -60,6 +60,10 @@ struct OnlineGameView: View {
     /// Flag transient : cadran rouge sur les cartes pendant ~1.5s après un
     /// confirm raté (catégorie sélectionnée mais 0 carte). Auto-clear.
     @State private var promptCardSelection: Bool = false
+    /// Message transitoire « X anime maintenant la partie » (relève d'hôte).
+    @State private var hostChangeMessage: String? = nil
+    /// Jeton d'annulation de la bannière précédente.
+    @State private var hostBannerNonce: Int = 0
 
     var body: some View {
         GeometryReader { geo in
@@ -74,6 +78,10 @@ struct OnlineGameView: View {
                 }
             }
         }
+        // `.contain` : l'identifiant reste sur le conteneur et n'écrase PAS ceux
+        // des enfants (cartes, panneau d'annonce) — vu au tour du 25/09.
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("game.root")
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(true) // pas de retour accidentel en partie
         .toolbar(.hidden, for: .tabBar)      // masque la tabbar pendant la partie
@@ -88,6 +96,7 @@ struct OnlineGameView: View {
                     Image(systemName: "slider.horizontal.3")
                 }
                 .tint(Theme.brandRed)
+                .accessibilityIdentifier("game.settings")
             }
             // Spectator count : visible UNIQUEMENT s'il y a au moins 1 spectateur
             // ou joueur en attente pour la prochaine manche. Chiffre AVANT l'œil.
@@ -116,6 +125,7 @@ struct OnlineGameView: View {
                     Image(systemName: "eurosign.circle")
                 }
                 .tint(Theme.brandRed)
+                .accessibilityIdentifier("game.balance")
             }
         }
         .sheet(isPresented: $showingBalanceSheet) {
@@ -134,8 +144,9 @@ struct OnlineGameView: View {
         }
         .task(id: service.room?.gameState?.hands[mySeat() ?? -1]) {
             let h = service.room?.gameState?.hands[mySeat() ?? -1] ?? []
-            // Les 2 dernières cartes du deal sont publiques en Flash mode.
-            publicCards = Set(h.suffix(2))
+            // En Flash, les k dernières cartes du deal sont publiques
+            // (k = taille de main − 4 : 2 à 6 cartes, 1 à 5, 0 à 4 — RULES.md).
+            publicCards = Set(h.suffix(flashPublicCount))
             await dealHandAnimated(target: h)
         }
         .onChange(of: service.room?.gameState?.currentBoard) {
@@ -158,6 +169,48 @@ struct OnlineGameView: View {
                 AllHandsSheet(gs: gs, target: target)
             }
         }
+        // Bannière de relève d'hôte + reconnexion (T22/T20).
+        .overlay(alignment: .top) { statusBanner }
+        .onChange(of: service.hostDisplayName) { oldName, newName in
+            guard oldName != nil, let newName, !newName.isEmpty else { return }
+            hostChangeMessage = "\(newName) anime maintenant la partie"
+            hostBannerNonce += 1
+            let nonce = hostBannerNonce
+            Task {
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if hostBannerNonce == nonce { hostChangeMessage = nil }
+            }
+        }
+    }
+
+    // MARK: - Bannière d'état (reconnexion / relève d'hôte)
+
+    @ViewBuilder
+    private var statusBanner: some View {
+        if let message = bannerMessage {
+            HStack(spacing: 8) {
+                if service.connectionState != .connected {
+                    ProgressView().controlSize(.mini).tint(.white)
+                }
+                Text(message)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Capsule().fill(Color.black.opacity(0.78)))
+            .accessibilityIdentifier("game.banner")
+            .padding(.top, 6)
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .animation(.easeInOut(duration: 0.25), value: message)
+        }
+    }
+
+    private var bannerMessage: String? {
+        if service.connectionState == .offline { return "Hors ligne — reconnexion…" }
+        if service.connectionState == .reconnecting || service.isReconnecting { return "Reconnexion…" }
+        return hostChangeMessage
     }
 
     // MARK: - Sizing helpers
@@ -190,7 +243,7 @@ struct OnlineGameView: View {
         let myUid = auth.userId
         let active = gs.players.filter {
             $0.inManche &&
-            (gs.hands[$0.seat]?.count ?? 0) >= 2 &&
+            (gs.hands[$0.seat]?.count ?? 0) >= 1 &&
             $0.userId != myUid
         }
         VStack(alignment: .leading, spacing: 8) {
@@ -218,7 +271,9 @@ struct OnlineGameView: View {
                             .font(.subheadline)
                         Spacer()
                         HStack(spacing: 4) {
-                            ForEach(Array((gs.hands[p.seat] ?? []).suffix(2)), id: \.self) { c in
+                            // Côté invité, le serveur ne livre QUE les cartes
+                            // publiques des autres ; côté hôte on tronque.
+                            ForEach(Array((gs.hands[p.seat] ?? []).suffix(flashPublicCount)), id: \.self) { c in
                                 CardImageView(card: c, width: 30)
                             }
                         }
@@ -287,6 +342,8 @@ struct OnlineGameView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("Board \(idx + 1)")
+                    .accessibilityIdentifier("game.board\(idx + 1).title")
+                    .accessibilityValue("\(cards.count)")
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(isActive ? Theme.brandRed : .primary)
                 if isActive && gs.phase == .announcing {
@@ -410,12 +467,14 @@ struct OnlineGameView: View {
             let winnerRow = result.perPlayer.first(where: { $0.seat == winnerSeat })
             let displayedCards: [Card] = {
                 if let row = winnerRow, !row.cards.isEmpty { return row.cards }
-                if let hole = gs.hands[winnerSeat] {
+                // Main du gagnant inconnue (état expurgé côté guest — T14) :
+                // on se rabat sur les cartes qu'il a soumises.
+                if let hole = gs.hands[winnerSeat], !hole.isEmpty {
                     return HandEvaluator.autoPickCards(announced: cat,
                                                        hole: hole,
                                                        board: gs.communityCards[boardIdx]) ?? []
                 }
-                return []
+                return winnerRow?.cards ?? []
             }()
             HStack(spacing: 10) {
                 Text(result.isSplit ? "⚡" : "🏆")
@@ -553,6 +612,12 @@ struct OnlineGameView: View {
                     .stroke(borderColor, lineWidth: borderWidth)
             )
             .offset(y: isSelected ? -10 : 0)
+            // XCUITest : une Image SwiftUI décorative n'est pas un élément
+            // d'accessibilité — sans `accessibilityElement()` l'identifiant
+            // « game.hand.cardN » n'est jamais exposé au tour.
+            .accessibilityElement()
+            .accessibilityLabel(Text(faceDown ? "Carte face cachée" : c.description))
+            .accessibilityIdentifier("game.hand.card\(idx)")
             .animation(.easeOut(duration: 0.15), value: isSelected)
             .onTapGesture {
                 if faceDown {
@@ -609,8 +674,22 @@ struct OnlineGameView: View {
                     selectedCards: selectedCards,
                     onConfirm: {
                         let cat = lockedCat ?? selectedCategory ?? .highcard
-                        // Toute catégorie — y compris Hauteur — exige au moins
-                        // 1 carte sélectionnée pour éviter les taps accidentels.
+                        // RULES.md § « Auto-pick vs sélection manuelle » :
+                        // « Hauteur : auto-pick par défaut — l'app choisit les
+                        // 2 meilleures cartes du joueur. Pas besoin de
+                        // sélectionner. » → Hauteur sans sélection (y compris
+                        // tie-break verrouillé sur Hauteur) = auto-pick.
+                        if cat == .highcard && selectedCards.isEmpty,
+                           let auto = HandEvaluator.autoPickCards(
+                               announced: .highcard,
+                               hole: gs.hands[seat] ?? [],
+                               board: boardCardsForAnnounce) {
+                            let submission = BoardSubmission(categoryId: cat.id, cards: auto)
+                            Task { await service.submitAnnounce(submission: submission, mySeat: seat) }
+                            return
+                        }
+                        // Les autres catégories exigent au moins 1 carte
+                        // sélectionnée pour éviter les taps accidentels.
                         // 0 carte → shake les cartes + cadran rouge transient.
                         if selectedCards.isEmpty {
                             withAnimation(.linear(duration: 0.4)) {
@@ -751,12 +830,13 @@ struct OnlineGameView: View {
             let winnerRow = result.perPlayer.first(where: { $0.seat == winnerSeat })
             let displayedCards: [Card] = {
                 if let row = winnerRow, !row.cards.isEmpty { return row.cards }
-                if let hole = gs.hands[winnerSeat] {
+                // Idem tie-break : à défaut de main, les cartes soumises.
+                if let hole = gs.hands[winnerSeat], !hole.isEmpty {
                     return HandEvaluator.autoPickCards(announced: cat,
                                                        hole: hole,
                                                        board: tb.cards) ?? []
                 }
-                return []
+                return winnerRow?.cards ?? []
             }()
             HStack(spacing: 10) {
                 Text("🏆").font(.title3)
@@ -798,6 +878,7 @@ struct OnlineGameView: View {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                 Text("Manche \(gs.mancheNumber) terminée")
+                    .accessibilityIdentifier("game.mancheEnd")
                     .font(.subheadline.weight(.bold))
                 Spacer()
             }
@@ -860,6 +941,7 @@ struct OnlineGameView: View {
                         .modifier(PrimaryButtonStyle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("game.nextManche")
             } else {
                 Label("En attente que l'hôte démarre la suivante…", systemImage: "hourglass")
                     .font(.subheadline)
@@ -975,6 +1057,7 @@ struct OnlineGameView: View {
                 currentBoard: service.room?.gameState?.currentBoard,
                 mancheNumber: service.room?.gameState?.mancheNumber,
                 tiebreakRound: service.room?.gameState?.tiebreakBoards.last.map { "tb-\($0.parentBoardIdx)-\($0.round)" },
+                isMancheEnd: service.room?.gameState?.phase == .mancheEnd,
                 anchor: .top,
                 proxy: proxy
             ))
@@ -982,8 +1065,12 @@ struct OnlineGameView: View {
         .safeAreaInset(edge: .bottom) {
             if let gs = service.room?.gameState,
                let seat = mySeat(in: gs),
-               gs.hands[seat] != nil,
-               gs.players.first(where: { $0.seat == seat })?.inManche == true {
+               gs.hands[seat]?.isEmpty == false,
+               gs.players.first(where: { $0.seat == seat })?.inManche == true,
+               // B-0001 : en fin de manche la main ne sert plus (le récap montre
+               // les cartes annoncées, « Autres mains » reste sur chaque board) ;
+               // on retire le tiroir pour que récap + « Manche suivante » restent visibles.
+               gs.phase != .mancheEnd {
                 handBubble(gs, seat: seat,
                            availableW: availableW, availableH: availableH)
                     .padding(.horizontal, handBubbleInnerPadding)
@@ -1017,6 +1104,7 @@ struct OnlineGameView: View {
                     currentBoard: service.room?.gameState?.currentBoard,
                     mancheNumber: service.room?.gameState?.mancheNumber,
                     tiebreakRound: service.room?.gameState?.tiebreakBoards.last.map { "tb-\($0.parentBoardIdx)-\($0.round)" },
+                    isMancheEnd: service.room?.gameState?.phase == .mancheEnd,
                     anchor: .center,
                     proxy: proxy
                 ))
@@ -1042,8 +1130,12 @@ struct OnlineGameView: View {
             Spacer(minLength: 0)
             if let gs = service.room?.gameState,
                let seat = mySeat(in: gs),
-               gs.hands[seat] != nil,
-               gs.players.first(where: { $0.seat == seat })?.inManche == true {
+               gs.hands[seat]?.isEmpty == false,
+               gs.players.first(where: { $0.seat == seat })?.inManche == true,
+               // B-0001 : en fin de manche la main ne sert plus (le récap montre
+               // les cartes annoncées, « Autres mains » reste sur chaque board) ;
+               // on retire le tiroir pour que récap + « Manche suivante » restent visibles.
+               gs.phase != .mancheEnd {
                 handBubble(gs, seat: seat,
                            availableW: availableW, availableH: availableH)
                     .padding(.horizontal, handBubbleInnerPadding)
@@ -1134,6 +1226,7 @@ struct OnlineGameView: View {
             }
             if gs.phase == .mancheEnd {
                 mancheEndPanel(gs)
+                    .id(BoardAutoScrollModifier.mancheEndID)
             }
         } else {
             ProgressView().padding(.top, 60)
@@ -1156,6 +1249,8 @@ struct OnlineGameView: View {
                     let label = navLabelForActiveBoard(gs)
                     let bg: Color = remaining <= 5 ? .red : .orange
                     Text("\(label) · \(remaining)s")
+                        .accessibilityIdentifier("game.phaseLabel")
+                        .accessibilityValue(label)
                         .font(.subheadline.weight(.bold))
                         .foregroundStyle(.white)
                         .monospacedDigit()
@@ -1164,6 +1259,11 @@ struct OnlineGameView: View {
                 }
             } else {
                 Text(phaseLabel(gs.phase))
+                    .accessibilityIdentifier("game.phaseLabel")
+                    // Valeur d'accessibilité = board actif (« B1 »… ou « Split »),
+                    // même sans timer : le tour s'en sert pour savoir quel board
+                    // attend l'annonce.
+                    .accessibilityValue(navLabelForActiveBoard(gs))
                     .font(.subheadline.weight(.bold))
             }
         }
@@ -1306,6 +1406,14 @@ struct OnlineGameView: View {
         return gs.players.first(where: { $0.userId == uid })?.seat
     }
 
+    /// Nombre de cartes publiques par joueur en mode Flash : taille de main − 4
+    /// (6 → 2, 5 → 1, 4 → 0). Cf. RULES.md § « Mode Flash ».
+    private var flashPublicCount: Int {
+        guard let gs = service.room?.gameState else { return 0 }
+        let active = gs.players.filter { $0.inManche }.count
+        return max(0, OnlineDealer.cardsPerPlayer(activeCount: active) - 4)
+    }
+
     private func mySeat() -> Int? {
         guard let gs = service.room?.gameState else { return nil }
         return mySeat(in: gs)
@@ -1409,11 +1517,24 @@ private struct BoardAutoScrollModifier: ViewModifier {
     let currentBoard: Int?
     let mancheNumber: Int?
     let tiebreakRound: String?
+    /// B-0001 : vrai en phase `mancheEnd` → on descend jusqu'au récap.
+    let isMancheEnd: Bool
     let anchor: UnitPoint
     let proxy: ScrollViewProxy
 
+    /// Identifiant de scroll du panneau de fin de manche.
+    static let mancheEndID = "manche-end"
+
     func body(content: Content) -> some View {
         content
+            .onAppear {
+                // Vue (re)montée directement en fin de manche (retour d'arrière-plan, reprise).
+                if isMancheEnd { scrollTo(Self.mancheEndID, anchor: .bottom) }
+            }
+            .onChange(of: isMancheEnd) { _, new in
+                // Entrée en fin de manche : le récap + « Manche suivante » en bas d'écran.
+                if new { scrollTo(Self.mancheEndID, anchor: .bottom) }
+            }
             .onChange(of: mancheNumber) { _, _ in
                 scrollTo("board-0")
             }
@@ -1427,11 +1548,11 @@ private struct BoardAutoScrollModifier: ViewModifier {
             }
     }
 
-    private func scrollTo(_ id: String) {
+    private func scrollTo(_ id: String, anchor overrideAnchor: UnitPoint? = nil) {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 80_000_000)  // 80ms : laisse le layout se faire
             withAnimation(.easeInOut(duration: 0.45)) {
-                proxy.scrollTo(id, anchor: anchor)
+                proxy.scrollTo(id, anchor: overrideAnchor ?? anchor)
             }
         }
     }

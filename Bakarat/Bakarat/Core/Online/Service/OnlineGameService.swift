@@ -2,74 +2,124 @@
 //  OnlineGameService.swift
 //  Bakarat
 //
-//  Service ObservableObject autour de Supabase Realtime V2. Une instance par
-//  vue (créée dans OnlineRootView via @StateObject). Gère le cycle de vie du
-//  channel : create/join → subscribe → broadcast → leave.
+//  Service ObservableObject du mode Online, posé sur `RoomTransport`
+//  (docs/PLAN_ONLINE_V2.md — T13).
 //
-//  Phase 1 : lobby uniquement.
-//    - Host : génère un code, ouvre `online:CODE`, se déclare participant,
-//             répond aux helloFromGuest avec un snapshot.
-//    - Guest : ouvre `online:CODE`, envoie helloFromGuest, attend un snapshot.
+//  Ce qui a changé par rapport à la v1 :
+//   • L'état ne vit plus dans la RAM de l'hôte mais dans `online_rooms`
+//     (jsonb versionné). Toute écriture passe par un CAS `room_publish`
+//     (`expected_version`) : deux écritures concurrentes ne s'écrasent jamais.
+//   • Il n'y a plus de broadcast, plus de presence Realtime, plus d'élection
+//     d'hôte maison, plus de reprise par UserDefaults. La reprise = `room_get`
+//     + `room_claim_host` (bail serveur, un seul gagnant).
+//   • Le tempo de l'hôte est une boucle de **pas idempotents** : chaque pas
+//     relit l'état après son attente et ne fait rien si la phase (ou le nombre
+//     de cartes) n'est plus celle attendue. Un pas rejoué après suspension iOS
+//     est donc inoffensif.
 //
-//  Phase 2+ : on ajoutera la propagation des actions (deal, announce, reveal,
-//  tie-break) via le même channel — d'où l'enveloppe OnlineMessage extensible.
+//  Toute la logique de jeu (scoring, reveal, tie-break, rebid, full board,
+//  distribution) est inchangée — seule la façon de lire et d'écrire l'état a
+//  bougé.
 //
 
-import Foundation
 import Combine
+import Foundation
 import Supabase
-import Realtime
 
 @MainActor
 final class OnlineGameService: ObservableObject {
+
+    // MARK: - État publié
+
     @Published private(set) var room: OnlineRoom?
     @Published private(set) var role: OnlineRole?
     @Published private(set) var phase: Phase = .idle
     @Published var lastError: String?
-    /// Numéro de tentative actuel du helloFromGuest (0 = pas de retry en cours).
-    /// Permet d'afficher "Tentative N/X" pendant que le guest attend le snapshot.
-    @Published private(set) var helloAttempt: Int = 0
-    /// Texte humain du dernier statut WebSocket du channel Realtime. Sert au
-    /// diagnostic dans l'UI lobby si la connexion ne se fait pas
-    /// (joined / errored / closed / etc.).
-    @Published private(set) var channelStatusLabel: String? = nil
-    /// Code du channel sur lequel on a tenté de se connecter (utile pour
-    /// afficher "Recherche du salon XXXX" pendant l'attente du snapshot).
+    /// État de la connexion (bannière UI).
+    @Published private(set) var connectionState: RoomTransport.ConnectionState = .offline
+    /// Nom de la personne qui anime la partie (bannière « X anime maintenant »).
+    @Published private(set) var hostDisplayName: String?
+    /// Vrai pendant une resynchronisation (retour au premier plan, réseau revenu).
+    @Published private(set) var isReconnecting: Bool = false
+    /// Décalage horloge locale → serveur (secondes). `Date() + offset ≈ now()`.
+    @Published private(set) var serverTimeOffset: TimeInterval = 0
+    /// Code du salon en cours d'ouverture (loader lobby).
     @Published private(set) var pendingChannelCode: String?
-    /// Nombre total de tentatives avant abandon (visible dans le loader UI).
-    static let maxHelloAttempts: Int = 5
+    /// Libellé de diagnostic affiché sous le loader / l'erreur.
+    @Published private(set) var channelStatusLabel: String?
 
     enum Phase: Equatable {
         /// Pas encore dans une room (vue entry)
         case idle
-        /// En cours d'ouverture du channel (loader)
+        /// En cours d'ouverture du salon (loader)
         case connecting
         /// Connecté, en lobby (avant start)
         case lobby
-        /// La partie est lancée (Phase 2+)
+        /// La partie est lancée
         case playing
-        /// On a quitté ou été déco
+        /// On a quitté
         case left
     }
 
-    private let client = SupabaseClientProvider.shared
-    private var channel: RealtimeChannelV2?
-    private var subscribeTask: Task<Void, Never>?
-    private var listenerTask: Task<Void, Never>?
-    private var helloRetryTask: Task<Void, Never>?
-    private var announceTimerTask: Task<Void, Never>?
-    private var presenceTask: Task<Void, Never>?
-    /// Task qui bump `last_active_at` côté Supabase toutes les 30s pour
-    /// signaler que le salon est encore vivant (côté histoire / "En cours").
-    private var touchActiveTask: Task<Void, Never>?
-    private var myUserIdCache: UUID?
+    // MARK: - Dépendances
 
-    /// Intervalle de heartbeat du touch_game_active.
+    let transport: RoomTransport
+    private let client: SupabaseClient
+
+    // MARK: - État interne
+
+    private(set) var myUserId: UUID?
+    private var myDisplayName: String = "Joueur"
+    /// Version de la ligne `online_rooms` correspondant à `room`.
+    private(set) var version: Int64 = 0
+    /// Membres tels que le serveur les connaît (présence + bail).
+    private(set) var members: [RoomMember] = []
+    private var serverNow: Date = Date()
+    private var hostLeaseUntil: Date = Date(timeIntervalSince1970: 0)
+    private var serverHostUserId: UUID?
+
+    private var snapshotTask: Task<Void, Never>?
+    private var connectionTask: Task<Void, Never>?
+    private var hostDriverTask: Task<Void, Never>?
+    private var touchActiveTask: Task<Void, Never>?
+    private var isClaimingHost = false
+    private var lastClaimAttempt: Date = .distantPast
+    private var isResolvingBoard = false
+    /// Manches déjà persistées (idempotence de `record_manche`).
+    private var recordedManches: Set<Int> = []
+    /// B-0004/B-0005 : userIds déjà poussés dans `game_participants` par
+    /// `ensure_game_and_participants` (dernier appel réussi).
+    private var cloudSyncedParticipantIds: Set<UUID> = []
+    /// Un seul `ensureGameInCloud` à la fois.
+    private var isEnsuringGame = false
+    /// Horodatage du dernier `ensureGameInCloud` déclenché par un changement de participants.
+    private var lastParticipantsSyncAt: Date = .distantPast
+
+    /// Intervalle de heartbeat du `touch_game_active` (historique « En cours »).
     private static let touchInterval: TimeInterval = 30
+    /// Grâce de présence : au-delà, le joueur est marqué déconnecté.
+    private static let presenceGraceSeconds: TimeInterval = 20
+    /// Au-delà, et seulement s'il bloque le reveal, il est mis en forfait.
+    private static let forfeitSilenceSeconds: TimeInterval = 60
+    /// Marge avant de considérer le bail d'hôte comme expiré.
+    private static let leaseSlackSeconds: TimeInterval = 5
+
+    // MARK: - Init
+
+    /// `client` nil = client partagé de l'app. Injectable pour les bots QA.
+    init(client: SupabaseClient? = nil,
+         chaos: ChaosProfile? = nil) {
+        let resolved = client ?? SupabaseClientProvider.shared
+        self.client = resolved
+        self.transport = RoomTransport(client: resolved, chaos: chaos)
+        self.transport.onHeartbeat = { [weak self] hb in
+            guard let self else { return }
+            Task { await self.handleHeartbeat(hb) }
+        }
+    }
 
     // MARK: - Logging
 
-    /// Log de debug — préfixé par le rôle pour reconnaître HOST vs GUEST dans la console.
     private func log(_ msg: String) {
         #if DEBUG
         let tag: String
@@ -79,445 +129,857 @@ final class OnlineGameService: ObservableObject {
         case .none:  tag = "?    "
         }
         print("[Online \(tag)] \(msg)")
+        QALog.write("[Online \(tag)] \(msg)")
         #endif
     }
 
-    // MARK: - Public API
+    // MARK: - Reprise (code mémorisé)
 
-    /// Crée une nouvelle room et devient host.
-    func createRoom(myUserId: UUID, myDisplayName: String) async {
-        let code = RoomCode.random()
-        let me = OnlineParticipant(userId: myUserId, displayName: myDisplayName, isHost: true)
-        self.role = .host
-        self.room = OnlineRoom(code: code, hostUserId: myUserId, participants: [me], status: .lobby)
-        log("createRoom code=\(code) user=\(myDisplayName) (\(myUserId.uuidString.prefix(8)))")
-        await openChannel(code: code, myUserId: myUserId, myDisplayName: myDisplayName)
-        // Si openChannel a échoué, role/room ont été nilés par
-        // finishConnectFailure : on n'a rien d'autre à faire ici.
-        guard role == .host, room != nil else { return }
-        // Crée la game dans Supabase dès la création du lobby — elle apparaîtra
-        // dans l'historique immédiatement, avant la 1re manche.
-        await ensureGameInCloud()
-        startTouchActiveLoop()
+    private static let lastRoomCodeKey = "online_last_room_code"
+    private static let lastRoomAtKey = "online_last_room_at"
+    /// Au-delà de 2 h, on ne propose plus de reprendre le salon.
+    private static let lastRoomMaxAge: TimeInterval = 2 * 60 * 60
+
+    static func rememberRoom(code: String) {
+        UserDefaults.standard.set(code, forKey: lastRoomCodeKey)
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: lastRoomAtKey)
     }
 
-    /// Rejoint une room existante en tant que guest.
-    /// Retourne false si le code a un format invalide (=> ne navigue pas au salon).
+    static func forgetRoom() {
+        UserDefaults.standard.removeObject(forKey: lastRoomCodeKey)
+        UserDefaults.standard.removeObject(forKey: lastRoomAtKey)
+    }
+
+    /// Code du dernier salon rejoint, s'il date de moins de 2 h.
+    static func rememberedRoomCode() -> String? {
+        guard let code = UserDefaults.standard.string(forKey: lastRoomCodeKey) else { return nil }
+        let at = UserDefaults.standard.double(forKey: lastRoomAtKey)
+        guard at > 0, Date().timeIntervalSince1970 - at < lastRoomMaxAge else {
+            forgetRoom()
+            return nil
+        }
+        return code
+    }
+
+    // MARK: - API publique : création / join / départ
+
+    /// Crée un salon et devient hôte. Le code est généré côté client (ou forcé
+    /// par `-qaRoomCode` en DEBUG) : en cas de collision `CODE_TAKEN`, on
+    /// réessaie avec un autre code.
+    func createRoom(myUserId: UUID, myDisplayName: String) async {
+        guard await ensureSession() else { return }
+        self.myUserId = myUserId
+        self.myDisplayName = myDisplayName
+        self.lastError = nil
+        self.phase = .connecting
+        self.role = .host
+
+        var forcedCode = QALaunchOptions.forcedRoomCode
+        var attempt = 0
+        while attempt < 5 {
+            attempt += 1
+            let code = forcedCode ?? RoomCode.random()
+            forcedCode = nil
+            let seed = OnlineRoom(code: code,
+                                  hostUserId: myUserId,
+                                  participants: [OnlineParticipant(userId: myUserId,
+                                                                   displayName: myDisplayName,
+                                                                   isHost: true)],
+                                  status: .lobby)
+            pendingChannelCode = code
+            do {
+                let env = try await transport.create(code: code,
+                                                     displayName: myDisplayName,
+                                                     state: seed)
+                applyEnvelope(env)
+                await finishOpening(code: code)
+                await ensureGameInCloud()
+                startTouchActiveLoop()
+                startHostDriver()
+                return
+            } catch RoomError.codeTaken {
+                log("createRoom: code \(code) déjà pris, nouvel essai")
+                continue
+            } catch {
+                await failConnection(RoomError.from(error).userMessage)
+                return
+            }
+        }
+        await failConnection("Impossible de créer un salon (codes déjà pris). Réessayez.")
+    }
+
+    /// Rejoint un salon existant. Retourne false si le code a un format invalide.
     @discardableResult
     func joinRoom(code rawCode: String, myUserId: UUID, myDisplayName: String) async -> Bool {
         let code = rawCode.uppercased().filter { $0.isLetter || $0.isNumber }
         guard code.count == 4 else {
             lastError = "Code invalide (4 caractères attendus)."
-            log("joinRoom REJECTED: bad format '\(rawCode)' → '\(code)' (\(code.count) chars)")
             return false
         }
-        self.role = .guest
-        self.room = nil
+        guard await ensureSession() else { return true }
+        self.myUserId = myUserId
+        self.myDisplayName = myDisplayName
         self.lastError = nil
-        log("joinRoom code=\(code) user=\(myDisplayName) (\(myUserId.uuidString.prefix(8)))")
-        await openChannel(code: code, myUserId: myUserId, myDisplayName: myDisplayName)
-        return true
+        self.phase = .connecting
+        self.pendingChannelCode = code
+        self.role = .guest
+
+        do {
+            let env = try await transport.join(code: code, displayName: myDisplayName)
+            applyEnvelope(env)
+            await finishOpening(code: code)
+            startTouchActiveLoop()
+            if role == .host { startHostDriver() }
+            return true
+        } catch {
+            await failConnection(RoomError.from(error).userMessage)
+            return true
+        }
     }
 
-    /// Quitte la room (broadcast de leave + unsubscribe).
-    func leave(myUserId: UUID) async {
-        let code = room?.code ?? "?"
-        let cloudId = room?.cloudGameId?.uuidString.prefix(8) ?? "nil"
-        log("leave START — code=\(code) cloudGameId=\(cloudId) role=\(String(describing: role))")
-        if role == .host {
-            clearHostState()
+    /// Ouvre le transport (channel + poll) et branche les flux.
+    private func finishOpening(code: String) async {
+        Self.rememberRoom(code: code)
+        do {
+            try await transport.open(code: code)
+        } catch {
+            log("open transport: \(error.localizedDescription)")
         }
-        if let channel {
-            // Best-effort leave broadcast — important pour que les autres
-            // clients voient le départ.
-            do {
-                try await sendMessage(.init(kind: .leave, payload: .leave(userId: myUserId)))
-                log("  leave broadcast sent OK")
-            } catch {
-                log("  leave broadcast FAILED: \(error.localizedDescription)")
+        observeTransport()
+        phase = (room?.status == .playing) ? .playing : .lobby
+        pendingChannelCode = nil
+    }
+
+    private func observeTransport() {
+        snapshotTask?.cancel()
+        let stream = transport.snapshots
+        snapshotTask = Task { [weak self] in
+            for await env in stream {
+                guard let self, !Task.isCancelled else { return }
+                self.applyEnvelope(env)
+                await self.reactToSnapshot()
             }
-            await channel.unsubscribe()
-            log("  channel unsubscribed")
         }
-        listenerTask?.cancel()
-        subscribeTask?.cancel()
-        helloRetryTask?.cancel()
-        announceTimerTask?.cancel()
-        presenceTask?.cancel()
-        touchActiveTask?.cancel()
-        touchActiveTask = nil
-        channel = nil
+        connectionTask?.cancel()
+        connectionTask = Task { [weak self] in
+            guard let self else { return }
+            // `connectionState` est @Published sur le transport : on le recopie
+            // dans le service pour que les vues n'observent qu'un objet.
+            for await state in self.transport.$connectionState.values {
+                guard !Task.isCancelled else { return }
+                self.connectionState = state
+                self.channelStatusLabel = state.rawValue
+            }
+        }
+    }
+
+    /// Vérifie qu'on a bien une session Supabase. Plus de `signInAnonymously`
+    /// en fallback (T03a) : on remonte une erreur claire.
+    private func ensureSession() async -> Bool {
+        do {
+            _ = try await client.auth.session
+            return true
+        } catch {
+            lastError = RoomError.noSession.userMessage
+            phase = .idle
+            role = nil
+            room = nil
+            return false
+        }
+    }
+
+    private func failConnection(_ message: String) async {
+        lastError = message
+        phase = .idle
+        pendingChannelCode = nil
+        role = nil
+        room = nil
+        await transport.close()
+    }
+
+    /// Quitte le salon — geste EXPLICITE uniquement (T03b).
+    func leave() async {
+        let code = room?.code
+        log("leave code=\(code ?? "?")")
+        hostDriverTask?.cancel(); hostDriverTask = nil
+        touchActiveTask?.cancel(); touchActiveTask = nil
+        snapshotTask?.cancel(); snapshotTask = nil
+        connectionTask?.cancel(); connectionTask = nil
+        if let code {
+            try? await transport.leaveRoom(code: code)
+        }
+        await transport.close()
+        Self.forgetRoom()
         room = nil
         role = nil
-        phase = .left
+        members = []
+        version = 0
+        recordedManches = []
+        hostDisplayName = nil
         pendingChannelCode = nil
-        helloAttempt = 0
-        channelStatusLabel = nil
-        log("leave END")
+        phase = .left
     }
 
-    /// Host : met à jour les réglages de la room en lobby (prix, flash, timer) et broadcast.
-    /// Sans effet pour les guests (la modif sera ignorée).
+    // MARK: - Cycle de vie iOS (T20)
+
+    /// Retour au premier plan : resync + reprise du tempo (idempotente).
+    func handleForeground() async {
+        guard room != nil else { return }
+        isReconnecting = true
+        await transport.resync()
+        isReconnecting = false
+        if role == .host { resumeFromCurrentPhase() }
+    }
+
+    /// Passage en arrière-plan : on coupe le tempo (il repartira au retour).
+    func handleBackground() {
+        hostDriverTask?.cancel()
+        hostDriverTask = nil
+    }
+
+    // MARK: - Application d'une enveloppe
+
+    private func applyEnvelope(_ env: RoomEnvelope) {
+        guard env.version > version else { return }
+        version = env.version
+        room = env.state
+        members = env.members
+        serverNow = env.serverNow
+        hostLeaseUntil = env.hostLeaseUntil
+        serverHostUserId = env.hostUserId
+        serverTimeOffset = env.serverNow.timeIntervalSinceNow
+        hostDisplayName = env.state.participants
+            .first(where: { $0.userId == env.hostUserId })?.displayName
+
+        if env.state.status == .playing, phase != .left { phase = .playing }
+        else if phase == .connecting { phase = .lobby }
+
+        applyRoleFromServer(hostUserId: env.hostUserId)
+    }
+
+    private func applyRoleFromServer(hostUserId: UUID) {
+        guard let me = myUserId else { return }
+        let shouldBeHost = (hostUserId == me)
+        if shouldBeHost, role != .host {
+            log("je deviens hôte (bail serveur)")
+            role = .host
+            startHostDriver()
+            startTouchActiveLoop()
+        } else if !shouldBeHost, role == .host {
+            log("un autre client anime la partie — je repasse guest")
+            role = .guest
+            hostDriverTask?.cancel()
+            hostDriverTask = nil
+        }
+    }
+
+    /// Réaction à chaque snapshot : présence + reveal si tout le monde a soumis
+    /// (hôte), relève du bail (guest).
+    private func reactToSnapshot() async {
+        if role == .host {
+            await syncCloudParticipantsIfNeeded()
+            await syncPresenceFlags()
+            await checkAllSubmitted()
+        } else {
+            await evaluateHostLease()
+        }
+    }
+
+    private func handleHeartbeat(_ hb: RoomHeartbeat) async {
+        members = hb.members
+        serverNow = hb.serverNow
+        hostLeaseUntil = hb.hostLeaseUntil
+        serverHostUserId = hb.hostUserId
+        serverTimeOffset = hb.serverNow.timeIntervalSinceNow
+        applyRoleFromServer(hostUserId: hb.hostUserId)
+        if role == .host {
+            // Rattrapage du throttle : le heartbeat (2 s lobby / 5 s partie) relance
+            // la synchro si un snapshot l'avait différée.
+            await syncCloudParticipantsIfNeeded()
+            await syncPresenceFlags()
+        } else {
+            await evaluateHostLease()
+        }
+    }
+
+    // MARK: - Bail d'hôte et relève (T22)
+
+    /// Guest : si le bail est expiré depuis > 5 s et que je suis le plus petit
+    /// seat connecté, je réclame l'animation.
+    private func evaluateHostLease() async {
+        guard role == .guest, let code = room?.code, let me = myUserId else { return }
+        guard !isClaimingHost else { return }
+        guard hostLeaseUntil < serverNow.addingTimeInterval(-Self.leaseSlackSeconds) else { return }
+        guard Date().timeIntervalSince(lastClaimAttempt) > 3 else { return }
+        guard lowestConnectedCandidate() == me else { return }
+
+        isClaimingHost = true
+        lastClaimAttempt = Date()
+        defer { isClaimingHost = false }
+        do {
+            let env = try await transport.claimHost(code: code)
+            applyEnvelope(env)
+            if env.hostUserId == me {
+                log("bail repris — j'anime la partie")
+                role = .host
+                resumeFromCurrentPhase()
+                startTouchActiveLoop()
+            }
+        } catch RoomError.leaseActive {
+            // Quelqu'un d'autre a gagné la course : rien à faire.
+        } catch {
+            log("room_claim_host: \(error.localizedDescription)")
+        }
+    }
+
+    /// Plus petit seat parmi les membres connectés et non partis.
+    private func lowestConnectedCandidate() -> UUID? {
+        guard let room else { return nil }
+        let connectedIds = Set(connectedMemberIds())
+        let seatByUser: [UUID: Int]
+        if let gs = room.gameState {
+            seatByUser = Dictionary(uniqueKeysWithValues: gs.players.map { ($0.userId, $0.seat) })
+        } else {
+            seatByUser = Dictionary(uniqueKeysWithValues:
+                room.participants.enumerated().map { ($0.element.userId, $0.offset) })
+        }
+        let candidates = seatByUser
+            .filter { connectedIds.contains($0.key) }
+            .sorted { $0.value < $1.value }
+        return candidates.first?.key
+    }
+
+    private func connectedMemberIds() -> [UUID] {
+        members.compactMap { m in
+            guard m.leftAt == nil else { return nil }
+            guard serverNow.timeIntervalSince(m.lastSeenAt) <= Self.presenceGraceSeconds else { return nil }
+            return m.userId
+        }
+    }
+
+    // MARK: - Présence avec grâce (T23)
+
+    /// Hôte : reporte `connected` dans `gs.players` (seulement quand ça change)
+    /// et ne pose un forfait qu'après 60 s de silence pendant une phase
+    /// d'annonce où ce siège bloque le reveal.
+    private func syncPresenceFlags() async {
+        guard role == .host, let gs = room?.gameState else { return }
+        let now = serverNow
+        var connectedByUser: [UUID: Bool] = [:]
+        var silentByUser: [UUID: Bool] = [:]
+        for m in members {
+            let silence = now.timeIntervalSince(m.lastSeenAt)
+            connectedByUser[m.userId] = (m.leftAt == nil) && silence <= Self.presenceGraceSeconds
+            silentByUser[m.userId] = (m.leftAt != nil) || silence > Self.forfeitSilenceSeconds
+        }
+        guard !connectedByUser.isEmpty else { return }
+
+        let isAnnouncePhase = (gs.phase == .announcing || gs.phase == .tiebreakAnnouncing)
+        let blocking = blockingSeats(in: gs)
+
+        await mutateGameState { state in
+            for i in state.players.indices {
+                let uid = state.players[i].userId
+                if let c = connectedByUser[uid], state.players[i].connected != c {
+                    state.players[i].connected = c
+                }
+                // Forfait : silence long ET ce siège bloque le reveal.
+                if isAnnouncePhase,
+                   silentByUser[uid] == true,
+                   blocking.contains(state.players[i].seat),
+                   state.players[i].inManche,
+                   state.players[i].forfeitFromBoard == nil {
+                    state.players[i].forfeitFromBoard = state.currentBoard
+                }
+            }
+        }
+    }
+
+    /// Sièges dont on attend encore une annonce (ils bloquent le reveal).
+    private func blockingSeats(in gs: OnlineGameState) -> Set<Int> {
+        if gs.phase == .announcing {
+            return eligibleSeats(in: gs).subtracting(Set(gs.submissions.keys))
+        }
+        if gs.phase == .tiebreakAnnouncing, let tb = gs.tiebreakBoards.last {
+            return Set(tb.eligibleSeats).subtracting(Set(tb.submissions.keys))
+        }
+        return []
+    }
+
+    // MARK: - Mutation hôte (CAS)
+
+    /// Applique une mutation à la room et la publie (CAS). En cas de conflit,
+    /// on repart de l'état renvoyé par le serveur et on rejoue la mutation
+    /// (5 tentatives max).
+    @discardableResult
+    private func mutate(_ apply: (inout OnlineRoom) -> Void) async -> Bool {
+        guard role == .host else { return false }
+        for _ in 0..<5 {
+            guard let base = room else { return false }
+            let expected = version
+            var candidate = base
+            apply(&candidate)
+            if candidate == base { return true }   // rien à écrire
+            do {
+                let result = try await transport.publish(code: candidate.code,
+                                                         expectedVersion: expected,
+                                                         state: candidate,
+                                                         status: candidate.status.rawValue)
+                applyEnvelope(result.room)
+                if result.conflict { continue }
+                return true
+            } catch RoomError.notHost {
+                log("room_publish → NOT_HOST : je repasse guest")
+                role = .guest
+                hostDriverTask?.cancel()
+                hostDriverTask = nil
+                await transport.resync()
+                return false
+            } catch {
+                lastError = RoomError.from(error).userMessage
+                return false
+            }
+        }
+        log("mutate: 5 conflits CAS d'affilée, abandon")
+        return false
+    }
+
+    /// Variante gameState, avec précondition évaluée sur l'état FRAIS au moment
+    /// de l'écriture (c'est ce qui rend les pas de tempo idempotents).
+    @discardableResult
+    private func mutateGameState(when precondition: (OnlineGameState) -> Bool = { _ in true },
+                                 _ apply: (inout OnlineGameState) -> Void) async -> Bool {
+        await mutate { room in
+            guard var gs = room.gameState, precondition(gs) else { return }
+            apply(&gs)
+            room.gameState = gs
+        }
+    }
+
+    /// Conservé pour la lisibilité des appels historiques.
+    private func updateGameState(_ apply: (inout OnlineGameState) -> Void) async {
+        await mutateGameState(apply)
+    }
+
+    // MARK: - Réglages (host)
+
     func updateSettings(linePrice: Double? = nil,
                         flashMode: Bool? = nil,
                         announceTimerSeconds: Int? = nil) async {
-        guard role == .host, var current = room else { return }
-        if let v = linePrice            { current.linePrice = v }
-        if let v = flashMode            { current.flashMode = v }
-        if let v = announceTimerSeconds { current.announceTimerSeconds = v }
-        room = current
-        log("updateSettings price=\(current.linePrice) flash=\(current.flashMode) timer=\(current.announceTimerSeconds)")
-        await broadcastSnapshot()
-        // Sync les nouveaux settings dans Supabase (linePrice, flash_mode,
-        // timer) — les guests qui regardent l'historique verront les valeurs
-        // à jour.
-        if current.cloudGameId != nil {
+        guard role == .host else { return }
+        let changed = await mutate { room in
+            if let v = linePrice            { room.linePrice = v }
+            if let v = flashMode            { room.flashMode = v }
+            if let v = announceTimerSeconds { room.announceTimerSeconds = v }
+        }
+        if changed, room?.cloudGameId != nil {
             await ensureGameInCloud()
         }
     }
 
-    /// Host uniquement : démarre la 1ère manche (génère le deck, distribue les
-    /// mains, prépare community + brûles). Broadcast immédiat.
+    // MARK: - Démarrage de manche
+
+    /// Host : démarre la 1ère manche. Le tempo est ensuite porté par le driver.
     func startGame() async {
-        log("startGame: called")
-        guard role == .host, var current = room else {
-            log("startGame: ABORT role=\(String(describing: role)) hasRoom=\(room != nil)")
-            return
-        }
-        log("startGame: \(current.participants.count) participants, linePrice=\(current.linePrice)")
+        guard role == .host, let current = room else { return }
         guard current.participants.count >= 2 else {
-            log("startGame: ABORT need ≥ 2 players")
             lastError = "Au moins 2 joueurs requis."
             return
         }
-
         guard let initialGameState = OnlineGameService.buildInitialGameState(
             mancheNumber: 1,
             participants: current.participants,
             dealerSeat: 0,
             linePrice: current.linePrice
         ) else {
-            log("startGame: ABORT buildInitialGameState returned nil")
             lastError = "Distribution impossible (trop de joueurs ou bug)."
             return
         }
-
-        log("startGame: built initial state — \(initialGameState.players.count) seats, \(initialGameState.hands.count) hands")
-        current.status = .playing
-        current.gameState = initialGameState
-        room = current
-        phase = .playing
-        log("startGame: room.status set to .playing, broadcasting…")
-        await broadcastSnapshot()
-        log("startGame: snapshot broadcast complete, waiting 3s before reveal")
-
-        // On laisse les joueurs encaisser leur main pendant quelques secondes
-        // (tension dramatique). Puis on enchaîne sur la révélation progressive
-        // de TOUTES les cartes communautaires.
-        try? await Task.sleep(nanoseconds: 3_000_000_000)
-        log("startGame: starting community reveal")
-        await revealCommunityProgressively()
+        let ok = await mutate { room in
+            guard room.status == .lobby else { return }
+            room.status = .playing
+            room.gameState = initialGameState
+        }
+        if ok {
+            phase = .playing
+            // Garantit que tous les joueurs (bots compris) sont dans `game_participants`
+            // avant la fin de la manche 1 (sinon « 1 joueur » dans Recent sessions).
+            await syncCloudParticipantsIfNeeded(force: true)
+            startHostDriver()
+        }
     }
 
-    // MARK: - Community reveal (tempo dramatique)
+    /// Host : démarre la manche suivante (rotation du donneur, scores conservés).
+    func startNextManche() async {
+        guard role == .host, let current = room, let gs = current.gameState else { return }
+        guard gs.phase == .mancheEnd else { return }
 
-    /// Délais pour le pacing de révélation (en nanosecondes).
-    private static let revealInterval: UInt64    = 700_000_000   // 0.7s entre 2 cartes
-    private static let burnPause: UInt64         = 1_200_000_000 // 1.2s avant chaque burn suivant
-    private static let preAnnouncePause: UInt64  = 1_500_000_000 // 1.5s avant la 1ère annonce
-    private static let boardRevealPause: UInt64  = 5_000_000_000 // 5s entre 2 reveals
-    private static let nextBoardAnnouncePause: UInt64 = 1_500_000_000
+        let spectatorSeats = Set(gs.players.filter { $0.wantsToSpectate }.map { $0.seat })
+        let n = gs.players.count
+        guard n > 0 else { return }
+        var nextDealer = (gs.dealerSeat + 1) % n
+        var safety = 0
+        while spectatorSeats.contains(nextDealer) && safety < n {
+            nextDealer = (nextDealer + 1) % n
+            safety += 1
+        }
+        guard !spectatorSeats.contains(nextDealer) else {
+            log("startNextManche: pas assez de joueurs actifs")
+            return
+        }
 
-    /// Host : dévoile progressivement les 15 cartes communautaires —
-    /// brûle 1 + flop (3×3 board par board) → brûle 2 + turn (1×3) →
-    /// brûle 3 + river (1×3). Annonce s'ouvre seulement après les 15 cartes.
-    func revealCommunityProgressively() async {
+        guard var newState = OnlineGameService.buildInitialGameState(
+            mancheNumber: gs.mancheNumber + 1,
+            participants: current.participants,
+            dealerSeat: nextDealer,
+            linePrice: current.linePrice,
+            spectatorSeats: spectatorSeats
+        ) else {
+            log("startNextManche: build failed")
+            return
+        }
+
+        // Carry-over des scores.
+        let oldScores = Dictionary(uniqueKeysWithValues: gs.players.map { ($0.seat, $0.score) })
+        for i in 0..<newState.players.count {
+            newState.players[i].score = oldScores[newState.players[i].seat] ?? 0
+        }
+        newState.initialScores = Dictionary(
+            uniqueKeysWithValues: newState.players.map { ($0.seat, $0.score) }
+        )
+
+        let targetManche = newState.mancheNumber
+        await mutateGameState(when: { $0.phase == .mancheEnd && $0.mancheNumber < targetManche }) { state in
+            state = newState
+        }
+        startHostDriver()
+    }
+
+    // MARK: - Driver de tempo (hôte) — pas idempotents
+
+    /// Délais de pacing (nanosecondes).
+    private static let revealInterval: UInt64    = 700_000_000
+    private static let burnPause: UInt64         = 1_200_000_000
+    private static let preAnnouncePause: UInt64  = 1_500_000_000
+    private static let boardRevealPause: UInt64  = 5_000_000_000
+    private static let tiebreakRevealPause: UInt64 = 4_000_000_000
+    private static let splitBadgePause: UInt64   = 2_500_000_000
+    private static let dealPause: UInt64         = 3_000_000_000
+    private static let idleTick: UInt64          = 400_000_000
+
+    /// (Re)lance la boucle de tempo. Idempotent : la boucle repart TOUJOURS de
+    /// l'état courant, donc reprendre au milieu d'un reveal ne rejoue rien.
+    func resumeFromCurrentPhase() {
+        startHostDriver()
+    }
+
+    private func startHostDriver() {
+        hostDriverTask?.cancel()
         guard role == .host else { return }
-
-        // ===== FLOP : board par board, carte par carte =====
-        await updateGameState { gs in
-            gs.phase = .flop
-            gs.burnsRevealed = max(gs.burnsRevealed, 1)
+        hostDriverTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self, self.role == .host else { return }
+                guard let gs = self.room?.gameState else {
+                    try? await Task.sleep(nanoseconds: Self.idleTick)
+                    continue
+                }
+                await self.driveOneStep(gs)
+            }
         }
-        for boardIdx in 0..<3 {
-            for cardIdx in 0..<3 {
+    }
+
+    /// Un seul pas de tempo. Chaque pas : attente → relecture → précondition →
+    /// écriture. Sans précondition satisfaite, le pas ne fait rien.
+    private func driveOneStep(_ gs: OnlineGameState) async {
+        switch gs.phase {
+
+        case .dealing:
+            // On laisse les joueurs encaisser leur main (tension dramatique).
+            try? await Task.sleep(nanoseconds: Self.dealPause)
+            guard !Task.isCancelled else { return }
+            await mutateGameState(when: { $0.phase == .dealing }) { state in
+                state.phase = .flop
+                state.burnsRevealed = max(state.burnsRevealed, 1)
+            }
+
+        case .flop:
+            if let (board, index) = nextMissingCommunityCard(gs, target: 3) {
                 try? await Task.sleep(nanoseconds: Self.revealInterval)
-                await updateGameState { gs in
-                    let card = gs.pendingFlop[boardIdx][cardIdx]
-                    if gs.communityCards[boardIdx].count <= cardIdx {
-                        gs.communityCards[boardIdx].append(card)
-                    }
+                guard !Task.isCancelled else { return }
+                await mutateGameState(when: {
+                    $0.phase == .flop && $0.communityCards[board].count == index
+                }) { state in
+                    state.communityCards[board].append(state.pendingFlop[board][index])
+                }
+            } else {
+                try? await Task.sleep(nanoseconds: Self.burnPause)
+                guard !Task.isCancelled else { return }
+                await mutateGameState(when: {
+                    $0.phase == .flop && $0.communityCards.allSatisfy { $0.count >= 3 }
+                }) { state in
+                    state.phase = .turn
+                    state.burnsRevealed = max(state.burnsRevealed, 2)
                 }
             }
-        }
 
-        // ===== TURN : une carte sur chaque board =====
-        try? await Task.sleep(nanoseconds: Self.burnPause)
-        await updateGameState { gs in
-            gs.phase = .turn
-            gs.burnsRevealed = max(gs.burnsRevealed, 2)
-        }
-        for boardIdx in 0..<3 {
-            try? await Task.sleep(nanoseconds: Self.revealInterval)
-            await updateGameState { gs in
-                let card = gs.pendingTurns[boardIdx]
-                if gs.communityCards[boardIdx].count < 4 {
-                    gs.communityCards[boardIdx].append(card)
+        case .turn:
+            if let (board, index) = nextMissingCommunityCard(gs, target: 4) {
+                try? await Task.sleep(nanoseconds: Self.revealInterval)
+                guard !Task.isCancelled else { return }
+                await mutateGameState(when: {
+                    $0.phase == .turn && $0.communityCards[board].count == index
+                }) { state in
+                    state.communityCards[board].append(state.pendingTurns[board])
+                }
+            } else {
+                try? await Task.sleep(nanoseconds: Self.burnPause)
+                guard !Task.isCancelled else { return }
+                await mutateGameState(when: {
+                    $0.phase == .turn && $0.communityCards.allSatisfy { $0.count >= 4 }
+                }) { state in
+                    state.phase = .river
+                    state.burnsRevealed = max(state.burnsRevealed, 3)
                 }
             }
-        }
 
-        // ===== RIVER : une carte sur chaque board =====
-        try? await Task.sleep(nanoseconds: Self.burnPause)
-        await updateGameState { gs in
-            gs.phase = .river
-            gs.burnsRevealed = max(gs.burnsRevealed, 3)
-        }
-        for boardIdx in 0..<3 {
-            try? await Task.sleep(nanoseconds: Self.revealInterval)
-            await updateGameState { gs in
-                let card = gs.pendingRivers[boardIdx]
-                if gs.communityCards[boardIdx].count < 5 {
-                    gs.communityCards[boardIdx].append(card)
+        case .river:
+            if let (board, index) = nextMissingCommunityCard(gs, target: 5) {
+                try? await Task.sleep(nanoseconds: Self.revealInterval)
+                guard !Task.isCancelled else { return }
+                await mutateGameState(when: {
+                    $0.phase == .river && $0.communityCards[board].count == index
+                }) { state in
+                    state.communityCards[board].append(state.pendingRivers[board])
                 }
+            } else {
+                // Les 15 cartes sont là : pause, puis annonces du board courant.
+                try? await Task.sleep(nanoseconds: Self.preAnnouncePause)
+                guard !Task.isCancelled else { return }
+                await enterAnnouncing()
             }
-        }
 
-        // ===== Pause pour laisser regarder le tableau complet, puis annonces board 1
-        try? await Task.sleep(nanoseconds: Self.preAnnouncePause)
-        await enterAnnouncing()
+        case .announcing, .tiebreakAnnouncing:
+            await handleAnnounceDeadlineIfNeeded()
+            await checkAllSubmitted()
+            try? await Task.sleep(nanoseconds: Self.idleTick)
+
+        case .boardReveal:
+            if gs.boardResults.indices.contains(gs.currentBoard),
+               gs.boardResults[gs.currentBoard] != nil {
+                // Le board courant est résolu → on avance.
+                let board = gs.currentBoard
+                try? await Task.sleep(nanoseconds: Self.boardRevealPause)
+                guard !Task.isCancelled else { return }
+                await advanceAfterReveal(expectedBoard: board)
+            } else {
+                // Board suivant déjà armé : on ouvre les annonces.
+                try? await Task.sleep(nanoseconds: Self.preAnnouncePause)
+                guard !Task.isCancelled else { return }
+                await enterAnnouncing()
+            }
+
+        case .tiebreakReveal:
+            let index = gs.tiebreakBoards.count - 1
+            try? await Task.sleep(nanoseconds: Self.tiebreakRevealPause)
+            guard !Task.isCancelled else { return }
+            await advanceAfterTiebreakReveal(expectedIndex: index)
+
+        case .mancheEnd:
+            await recordMancheToSupabase()
+            try? await Task.sleep(nanoseconds: Self.idleTick)
+        }
     }
 
-    /// Helper : applique une mutation au gameState courant et broadcast.
-    private func updateGameState(_ mutate: (inout OnlineGameState) -> Void) async {
-        guard var current = room, var gs = current.gameState else { return }
-        mutate(&gs)
-        current.gameState = gs
-        room = current
-        await broadcastSnapshot()
+    /// Premier (board, index) dont la carte communautaire manque pour atteindre
+    /// `target` cartes. nil = tous les boards sont complets.
+    private func nextMissingCommunityCard(_ gs: OnlineGameState, target: Int) -> (Int, Int)? {
+        for board in 0..<min(3, gs.communityCards.count) {
+            let count = gs.communityCards[board].count
+            if count < target { return (board, count) }
+        }
+        return nil
     }
+
+    // MARK: - Annonces
 
     /// Host : ouvre la phase d'annonces pour le board courant.
     func enterAnnouncing() async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
-        // On accepte d'arriver depuis :
-        //  - .river (fin de la révélation initiale → annonces board 1)
-        //  - .boardReveal (après reveal du board précédent → annonces board suivant)
-        guard gs.phase == .river || gs.phase == .boardReveal else { return }
-        gs.phase = .announcing
-        gs.submissions = [:]
-        gs.excludedThisBoard = []
-        gs.rebidRound = 0  // reset pour nouveau board
-        gs.announceDeadline = computeDeadline(seconds: current.announceTimerSeconds)
-        current.gameState = gs
-        room = current
-        await broadcastSnapshot()
-        scheduleAnnounceTimerIfNeeded(gs.announceDeadline)
+        guard role == .host, let current = room else { return }
+        let deadline = computeDeadline(seconds: current.announceTimerSeconds)
+        await mutateGameState(when: { $0.phase == .river || $0.phase == .boardReveal }) { gs in
+            gs.phase = .announcing
+            gs.submissions = [:]
+            gs.excludedThisBoard = []
+            gs.rebidRound = 0
+            gs.announceDeadline = deadline
+        }
     }
 
-    /// Calcule un timestamp (epoch sec) à atteindre, ou nil si timer désactivé.
+    /// Calcule un timestamp absolu (epoch sec) à atteindre, ou nil si désactivé.
     private func computeDeadline(seconds: Int) -> TimeInterval? {
         guard seconds > 0 else { return nil }
         return Date().timeIntervalSince1970 + Double(seconds)
     }
 
-    /// Programme un Task qui force le reveal quand la deadline est atteinte.
-    /// Au fire, on auto-skippe les joueurs qui n'ont pas soumis.
-    private func scheduleAnnounceTimerIfNeeded(_ deadline: TimeInterval?) {
-        announceTimerTask?.cancel()
-        guard let deadline else { return }
-        let delaySec = max(0, deadline - Date().timeIntervalSince1970)
-        announceTimerTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(delaySec * 1_000_000_000))
-            if Task.isCancelled { return }
-            await self?.timerExpired()
-        }
+    /// Host : à l'échéance du timer, auto-skip pour les sièges silencieux.
+    private func handleAnnounceDeadlineIfNeeded() async {
+        guard role == .host, let gs = room?.gameState else { return }
+        guard let deadline = gs.announceDeadline else { return }
+        guard Date().timeIntervalSince1970 >= deadline else { return }
+        await timerExpired()
     }
 
-    /// Host : au timeout, on auto-submit "skip" pour chaque seat éligible qui
-    /// n'a pas encore annoncé, puis on déclenche le reveal du board (ou tie-break).
     private func timerExpired() async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
-        log("timerExpired: phase=\(gs.phase.rawValue)")
+        guard role == .host, let gs = room?.gameState else { return }
         if gs.phase == .announcing {
             let eligible = eligibleSeats(in: gs)
-            for seat in eligible where gs.submissions[seat] == nil {
-                gs.submissions[seat] = BoardSubmission(categoryId: "skip", cards: [])
-                log("timerExpired: auto-skip seat=\(seat)")
+            await mutateGameState(when: { $0.phase == .announcing }) { state in
+                for seat in eligible where state.submissions[seat] == nil {
+                    state.submissions[seat] = BoardSubmission(categoryId: "skip", cards: [])
+                }
+                state.announceDeadline = nil
             }
-            current.gameState = gs
-            room = current
-            await broadcastSnapshot()
-            await revealBoard()
         } else if gs.phase == .tiebreakAnnouncing {
-            guard var tb = gs.tiebreakBoards.last else { return }
-            for seat in tb.eligibleSeats where tb.submissions[seat] == nil {
-                tb.submissions[seat] = BoardSubmission(categoryId: "skip", cards: [])
-                log("timerExpired: tiebreak auto-skip seat=\(seat)")
+            await mutateGameState(when: { $0.phase == .tiebreakAnnouncing && !$0.tiebreakBoards.isEmpty }) { state in
+                guard var tb = state.tiebreakBoards.last else { return }
+                for seat in tb.eligibleSeats where tb.submissions[seat] == nil {
+                    tb.submissions[seat] = BoardSubmission(categoryId: "skip", cards: [])
+                }
+                state.tiebreakBoards[state.tiebreakBoards.count - 1] = tb
+                state.announceDeadline = nil
             }
-            gs.tiebreakBoards[gs.tiebreakBoards.count - 1] = tb
-            current.gameState = gs
-            room = current
-            await broadcastSnapshot()
-            await revealTiebreakBoard()
         }
     }
 
-    /// Guest/host : demande à passer en spectateur (ou rejoindre) pour la
-    /// MANCHE SUIVANTE. Pour l'utilisateur courant uniquement.
-    /// Si l'hôte passe en spectateur → transfert d'hôte immédiat AVANT.
-    func setSelfSpectator(_ wantsToSpectate: Bool) async {
-        guard let uid = myUserIdCache, let gs = service_currentGameState() else { return }
-        guard let seat = gs.players.first(where: { $0.userId == uid })?.seat else { return }
-
-        // Si je suis hôte et je passe en spec → transfert AVANT pour ne pas
-        // me retrouver "hôte spectateur" (état incohérent).
-        if role == .host && wantsToSpectate {
-            await transferHostBeforeSpectating()
-        }
-
-        if role == .host {
-            await applySpectatorChange(seat: seat, wantsToSpectate: wantsToSpectate)
-        } else {
-            try? await sendMessage(
-                .init(kind: .setSpectator,
-                      payload: .setSpectator(seat: seat, wantsToSpectate: wantsToSpectate))
-            )
-        }
-    }
-
-    private func service_currentGameState() -> OnlineGameState? {
-        room?.gameState
-    }
-
-    /// Host uniquement : exclut un joueur de la partie (force-disconnect).
-    /// Utile quand la présence Realtime n'a pas détecté la déconnexion (joueur
-    /// figé / en airplane mode mais channel encore actif). Effet :
-    ///  - connected = false
-    ///  - forfeit du board courant (paye comme un loser sur les boards restants)
-    ///  - wantsToSpectate = true (retiré des manches suivantes ; peut revenir
-    ///    via le popover spectateurs s'il se reconnecte)
-    /// Le solde du joueur est conservé.
-    func kickPlayer(seat: Int) async {
-        guard role == .host, let myId = myUserIdCache else { return }
-        guard var current = room, var gs = current.gameState else { return }
-        guard let i = gs.players.firstIndex(where: { $0.seat == seat }) else { return }
-        // Pas de kick sur soi-même (l'hôte utilise "Quitter la partie").
-        guard gs.players[i].userId != myId else { return }
-
-        let name = gs.players[i].displayName
-        gs.players[i].connected = false
-        if gs.players[i].inManche,
-           gs.players[i].forfeitFromBoard == nil,
-           gs.phase != .mancheEnd {
-            gs.players[i].forfeitFromBoard = gs.currentBoard
-        }
-        gs.players[i].wantsToSpectate = true
-        current.gameState = gs
-        room = current
-        log("kickPlayer: seat=\(seat) (\(name))")
-        await broadcastSnapshot()
-        await checkAutoRevealAfterDisconnect()
-    }
-
-    /// Host : applique la préférence spectateur d'un seat (broadcast snapshot).
-    private func applySpectatorChange(seat: Int, wantsToSpectate: Bool) async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
-        guard let i = gs.players.firstIndex(where: { $0.seat == seat }) else { return }
-        guard gs.players[i].wantsToSpectate != wantsToSpectate else { return }
-        gs.players[i].wantsToSpectate = wantsToSpectate
-        log("applySpectatorChange: seat=\(seat) wants=\(wantsToSpectate)")
-        current.gameState = gs
-        room = current
-        await broadcastSnapshot()
-    }
-
-    /// Guest : envoie son annonce au host (intent).
+    /// Guest/host : envoie son annonce. Le guest passe par `room_submit`
+    /// (le serveur fusionne, l'hôte ne peut jamais l'effacer).
     func submitAnnounce(submission: BoardSubmission, mySeat: Int) async {
-        // Côté host on traite directement, côté guest on broadcast.
+        guard let code = room?.code else { return }
         if role == .host {
-            await handleIncomingSubmission(seat: mySeat, submission: submission)
+            await applyLocalSubmission(seat: mySeat, submission: submission)
+            await checkAllSubmitted()
         } else {
-            try? await sendMessage(
-                .init(kind: .submitAnnounce,
-                      payload: .submitAnnounce(seat: mySeat, submission: submission))
-            )
+            do {
+                let env = try await transport.submit(code: code, seat: mySeat, submission: submission)
+                applyEnvelope(env)
+            } catch RoomError.alreadySubmitted {
+                // Déjà pris en compte — rien à signaler.
+            } catch {
+                lastError = RoomError.from(error).userMessage
+            }
         }
     }
 
-    /// Host : route la soumission vers le handler du board courant ou du tie-break
-    /// actif, selon la phase.
-    private func handleIncomingSubmission(seat: Int, submission: BoardSubmission) async {
-        guard role == .host, let current = room, let gs = current.gameState else { return }
+    /// Hôte : applique sa propre annonce (mêmes règles que le RPC serveur).
+    private func applyLocalSubmission(seat: Int, submission: BoardSubmission) async {
+        guard let gs = room?.gameState else { return }
         switch gs.phase {
         case .announcing:
-            await handleRegularSubmission(seat: seat, submission: submission)
+            await mutateGameState(when: { state in
+                state.phase == .announcing
+                && state.submissions[seat] == nil
+                && !state.excludedThisBoard.contains(seat)
+                && Self.cardsBelongToHand(submission, hand: state.hands[seat] ?? [])
+            }) { state in
+                state.submissions[seat] = submission
+            }
         case .tiebreakAnnouncing:
-            await handleTiebreakSubmission(seat: seat, submission: submission)
+            await mutateGameState(when: { state in
+                guard state.phase == .tiebreakAnnouncing, let tb = state.tiebreakBoards.last else { return false }
+                return tb.eligibleSeats.contains(seat)
+                    && tb.submissions[seat] == nil
+                    && Self.cardsBelongToHand(submission, hand: state.hands[seat] ?? [])
+            }) { state in
+                guard var tb = state.tiebreakBoards.last else { return }
+                tb.submissions[seat] = submission
+                state.tiebreakBoards[state.tiebreakBoards.count - 1] = tb
+            }
         default:
-            log("submission ignored: phase=\(gs.phase.rawValue)")
             return
         }
     }
 
-    private func handleRegularSubmission(seat: Int, submission: BoardSubmission) async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
-        guard gs.phase == .announcing else { return }
-        guard gs.submissions[seat] == nil else { return }
-        guard !gs.excludedThisBoard.contains(seat) else { return }
-        if submission.categoryId != "skip" {
-            let myHand = gs.hands[seat] ?? []
-            for c in submission.cards where !myHand.contains(c) { return }
-        }
-        gs.submissions[seat] = submission
-        current.gameState = gs
-        room = current
-        await broadcastSnapshot()
-
-        let eligible = eligibleSeats(in: gs)
-        if Set(gs.submissions.keys).isSuperset(of: eligible) {
-            await revealBoard()
-        }
+    private static func cardsBelongToHand(_ submission: BoardSubmission, hand: [Card]) -> Bool {
+        if submission.categoryId == "skip" { return true }
+        // Main inconnue (état expurgé) : on laisse passer, le serveur tranche.
+        if hand.isEmpty { return true }
+        return submission.cards.allSatisfy { hand.contains($0) }
     }
 
-    private func handleTiebreakSubmission(seat: Int, submission: BoardSubmission) async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
-        guard gs.phase == .tiebreakAnnouncing else { return }
-        guard var tb = gs.tiebreakBoards.last else { return }
-        guard tb.eligibleSeats.contains(seat) else { return }
-        guard tb.submissions[seat] == nil else { return }
-        if submission.categoryId != "skip" {
-            let myHand = gs.hands[seat] ?? []
-            for c in submission.cards where !myHand.contains(c) { return }
-        }
-        tb.submissions[seat] = submission
-        gs.tiebreakBoards[gs.tiebreakBoards.count - 1] = tb
-        current.gameState = gs
-        room = current
-        await broadcastSnapshot()
-
-        let submitted = Set(tb.submissions.keys)
-        let eligibleSet = Set(tb.eligibleSeats)
-        if submitted.isSuperset(of: eligibleSet) {
+    /// Host, idempotent : si tous les éligibles ont soumis, on révèle.
+    private func checkAllSubmitted() async {
+        guard role == .host, !isResolvingBoard, let gs = room?.gameState else { return }
+        if gs.phase == .announcing {
+            let eligible = eligibleSeats(in: gs)
+            guard Set(gs.submissions.keys).isSuperset(of: eligible) else { return }
+            isResolvingBoard = true
+            defer { isResolvingBoard = false }
+            await revealBoard()
+        } else if gs.phase == .tiebreakAnnouncing, let tb = gs.tiebreakBoards.last {
+            let stillEligible = tb.eligibleSeats.filter { seat in
+                guard let p = gs.players.first(where: { $0.seat == seat }) else { return false }
+                return p.forfeitFromBoard == nil
+            }
+            guard Set(tb.submissions.keys).isSuperset(of: Set(stillEligible)) else { return }
+            isResolvingBoard = true
+            defer { isResolvingBoard = false }
             await revealTiebreakBoard()
         }
     }
 
+    // MARK: - Spectateur / kick
+
+    /// Demande à passer en spectateur (ou à revenir) pour la MANCHE SUIVANTE.
+    func setSelfSpectator(_ wantsToSpectate: Bool) async {
+        guard let uid = myUserId, let code = room?.code, let gs = room?.gameState else { return }
+        guard let seat = gs.players.first(where: { $0.userId == uid })?.seat else { return }
+        if role == .host {
+            await applySpectatorChange(seat: seat, wantsToSpectate: wantsToSpectate)
+        } else {
+            do {
+                let env = try await transport.setSpectator(code: code, seat: seat, wants: wantsToSpectate)
+                applyEnvelope(env)
+            } catch {
+                lastError = RoomError.from(error).userMessage
+            }
+        }
+    }
+
+    private func applySpectatorChange(seat: Int, wantsToSpectate: Bool) async {
+        await mutateGameState { gs in
+            guard let i = gs.players.firstIndex(where: { $0.seat == seat }) else { return }
+            guard gs.players[i].wantsToSpectate != wantsToSpectate else { return }
+            gs.players[i].wantsToSpectate = wantsToSpectate
+        }
+    }
+
+    /// Host : exclut un joueur (force-disconnect explicite).
+    func kickPlayer(seat: Int) async {
+        guard role == .host, let myId = myUserId else { return }
+        await mutateGameState { gs in
+            guard let i = gs.players.firstIndex(where: { $0.seat == seat }) else { return }
+            guard gs.players[i].userId != myId else { return }   // pas de kick sur soi
+            gs.players[i].connected = false
+            if gs.players[i].inManche,
+               gs.players[i].forfeitFromBoard == nil,
+               gs.phase != .mancheEnd {
+                gs.players[i].forfeitFromBoard = gs.currentBoard
+            }
+            gs.players[i].wantsToSpectate = true
+        }
+        await checkAllSubmitted()
+    }
+
+    // MARK: - Reveal du board (logique de jeu inchangée)
+
     /// Host : reveal du board courant. Détermine winner / split / abandon,
-    /// stocke dans boardResults[currentBoard], avance à la phase suivante
-    /// après un délai.
+    /// stocke dans boardResults[currentBoard].
     func revealBoard() async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
+        guard role == .host, let current = room, var gs = current.gameState else { return }
         guard gs.phase == .announcing else { return }
-        // Annule le timer dès l'entrée : empêche une seconde fire pendant le
-        // sleep/broadcast qui suit (race entre handleRegularSubmission "tous
-        // soumis → reveal" et timerExpired qui auto-skip).
-        announceTimerTask?.cancel()
-        announceTimerTask = nil
 
         let boardIdx = gs.currentBoard
         let boardCards = gs.communityCards[boardIdx]
-        // Construit le résultat par joueur
         var perPlayer: [PlayerBoardResult] = []
         for player in gs.players where player.inManche {
             let sub = gs.submissions[player.seat]
@@ -540,7 +1002,6 @@ final class OnlineGameService: ObservableObject {
             ))
         }
 
-        // Détermine le gagnant : meilleure catégorie valide, puis meilleur ranks
         let validResults = perPlayer.filter { $0.isValid }
         var winnerSeat: Int?
         var winningCategoryId: String?
@@ -554,29 +1015,26 @@ final class OnlineGameService: ObservableObject {
             let bluffers = perPlayer.filter { $0.isBluff }.map { $0.seat }
             gs.excludedThisBoard.append(contentsOf: bluffers)
 
-            // Check si rebid possible : au moins 1 joueur non exclu et < 3 rounds.
             let nonExcludedSeats = gs.players
                 .filter { $0.inManche && !gs.excludedThisBoard.contains($0.seat) }
                 .map { $0.seat }
             if !nonExcludedSeats.isEmpty && gs.rebidRound < 2 {
-                gs.rebidRound += 1
-                gs.submissions = [:]
-                gs.announceDeadline = computeDeadline(seconds: current.announceTimerSeconds)
-                current.gameState = gs
-                room = current
-                log("revealBoard: ALL BLUFF, rebid #\(gs.rebidRound) — eligibles=\(nonExcludedSeats)")
-                // On reste en .announcing : excludedThisBoard préserve les bluffeurs
-                // pour le prochain tour. Les non-exclus peuvent re-annoncer.
-                await broadcastSnapshot()
-                scheduleAnnounceTimerIfNeeded(gs.announceDeadline)
+                let deadline = computeDeadline(seconds: current.announceTimerSeconds)
+                let round = gs.rebidRound + 1
+                log("revealBoard: ALL BLUFF, rebid #\(round)")
+                await mutateGameState(when: { $0.phase == .announcing && $0.rebidRound < round }) { state in
+                    for seat in bluffers where !state.excludedThisBoard.contains(seat) {
+                        state.excludedThisBoard.append(seat)
+                    }
+                    state.rebidRound = round
+                    state.submissions = [:]
+                    state.announceDeadline = deadline
+                }
                 return
             }
             abandoned = true
         } else {
-            // Trie par force décroissante. L'annonce du joueur PRIME : on
-            // compare au sein de la catégorie annoncée (un joueur qui annonce
-            // Couleur ne profite PAS d'avoir une Quinte Flush ; idem un joueur
-            // qui annonce Hauteur n'est PAS upgradé en Paire si le board match).
+            // L'annonce du joueur PRIME : on compare au sein de la catégorie annoncée.
             let sorted = validResults.sorted { a, b in
                 guard let ca = a.announcedCategoryId.flatMap({ HandCategory.from(id: $0) }),
                       let cb = b.announcedCategoryId.flatMap({ HandCategory.from(id: $0) }) else { return false }
@@ -585,7 +1043,6 @@ final class OnlineGameService: ObservableObject {
             }
             let top = sorted[0]
             let topCat = top.announcedCategoryId.flatMap { HandCategory.from(id: $0) }
-            // Détection split : même catégorie + force égale dans CETTE catégorie
             let tied = sorted.filter { r in
                 guard r.announcedCategoryId == top.announcedCategoryId,
                       let cat = topCat else { return false }
@@ -594,9 +1051,6 @@ final class OnlineGameService: ObservableObject {
             if tied.count >= 2 {
                 isSplit = true
                 splitterSeats = tied.map { $0.seat }
-                // Pas de winner immédiat : on déclenche un tie-break sur un
-                // nouveau board virtuel. La méthode `enterTiebreak` ci-dessous
-                // pop 5 cartes du tiebreakPool et entre en .tiebreakAnnouncing.
                 winnerSeat = nil
                 winningCategoryId = top.announcedCategoryId
                 finalMulti = topCat?.multi ?? 1
@@ -613,38 +1067,38 @@ final class OnlineGameService: ObservableObject {
             isSplit: isSplit, splitterSeats: splitterSeats,
             perPlayer: perPlayer, abandoned: abandoned
         )
-        gs.boardResults[boardIdx] = result
+        let excluded = gs.excludedThisBoard
 
         if isSplit {
-            // Pas de scoring pour l'instant — on attend le tie-break.
-            current.gameState = gs
-            room = current
-            await broadcastSnapshot()
-            // Petit délai pour montrer le résultat du board avec le badge ⚡ Split
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            // Pas de scoring : on attend le tie-break.
+            await mutateGameState(when: {
+                $0.phase == .announcing && $0.currentBoard == boardIdx
+            }) { state in
+                state.excludedThisBoard = excluded
+                state.boardResults[boardIdx] = result
+                state.announceDeadline = nil
+            }
+            // Petit délai pour montrer le badge ⚡ Split.
+            try? await Task.sleep(nanoseconds: Self.splitBadgePause)
+            guard !Task.isCancelled else { return }
             await enterTiebreak(parentBoardIdx: boardIdx,
                                 eligibleSeats: splitterSeats,
                                 round: 0)
             return
         }
 
-        // Winner clair (ou board abandonné) : scoring + reveal classique
-        applyBoardScoring(gs: &gs, result: result)
-        gs.phase = .boardReveal
-        current.gameState = gs
-        room = current
-        await broadcastSnapshot()
-
-        try? await Task.sleep(nanoseconds: 5_000_000_000)
-        await advanceAfterReveal()
+        await mutateGameState(when: {
+            $0.phase == .announcing && $0.currentBoard == boardIdx
+        }) { state in
+            state.excludedThisBoard = excluded
+            state.boardResults[boardIdx] = result
+            self.applyBoardScoring(gs: &state, result: result)
+            state.phase = .boardReveal
+            state.announceDeadline = nil
+        }
     }
 
-    /// Compare deux annonces AU SEIN de la catégorie annoncée. Pour Hauteur,
-    /// on regarde uniquement la carte la plus haute parmi celles sélectionnées :
-    /// le "kicker" ne compte pas (sinon K-2 perdrait contre K-5 même si les
-    /// deux n'ont que K en réalité — voir le cas du board avec plein de
-    /// cartes > 5). Pour les autres catégories, on prend le meilleur 5-card
-    /// hand parmi (cartes annoncées + board).
+    /// Compare deux annonces AU SEIN de la catégorie annoncée.
     private func compareWithinCategory(_ cat: HandCategory,
                                        a: [Card],
                                        b: [Card],
@@ -662,20 +1116,12 @@ final class OnlineGameService: ObservableObject {
 
     // MARK: - Tie-break
 
-    /// Host : entre dans un round de tie-break sur un board virtuel (5 nouvelles
-    /// cartes). Les splitters re-sélectionnent leurs cartes pour la même
-    /// catégorie qu'ils ont annoncée à l'origine.
-    ///
-    /// Pool de cartes utilisé : **tout le deck (52 cartes) sauf les hole cards
-    /// des splitters** (qui sont les seules vraiment cachées au reste du monde).
-    /// Donc les cartes des non-splitters, les 3 boards et les brûles sont
-    /// rebattues dans la pile disponible — comme à la table réelle. On exclut
-    /// aussi les cartes des tours de tie-break précédents pour éviter
-    /// d'enchaîner deux fois la même.
+    /// Host : entre dans un round de tie-break sur un board virtuel (5 cartes
+    /// tirées hors hole cards des splitters et hors tie-breaks précédents).
     private func enterTiebreak(parentBoardIdx: Int,
                                eligibleSeats: [Int],
                                round: Int) async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
+        guard role == .host, let current = room, let gs = current.gameState else { return }
 
         let splitterHoles = Set(eligibleSeats.flatMap { gs.hands[$0] ?? [] })
         let alreadyUsedInTiebreaks = Set(gs.tiebreakBoards.flatMap { $0.cards })
@@ -685,46 +1131,41 @@ final class OnlineGameService: ObservableObject {
         pool.shuffle()
 
         guard pool.count >= 5 else {
-            log("enterTiebreak: pool epuisé apres exclusions (\(pool.count) cartes), winner arbitraire")
+            log("enterTiebreak: pool épuisé (\(pool.count)), winner arbitraire")
             if let first = eligibleSeats.first {
                 await finalizeParentBoard(parentBoardIdx: parentBoardIdx, winnerSeat: first)
             }
             return
         }
 
-        let tbCards = Array(pool.prefix(5))
-
+        // Les cartes sont tirées UNE fois, hors de la mutation (qui peut être
+        // rejouée en cas de conflit CAS).
         let tb = TiebreakBoard(
             parentBoardIdx: parentBoardIdx,
             round: round,
-            cards: tbCards,
+            cards: Array(pool.prefix(5)),
             eligibleSeats: eligibleSeats
         )
-        gs.tiebreakBoards.append(tb)
-        gs.phase = .tiebreakAnnouncing
-        gs.announceDeadline = computeDeadline(seconds: current.announceTimerSeconds)
-        current.gameState = gs
-        room = current
-        log("enterTiebreak: parent=\(parentBoardIdx) round=\(round) seats=\(eligibleSeats) pool=\(pool.count + 5)")
-        await broadcastSnapshot()
-        scheduleAnnounceTimerIfNeeded(gs.announceDeadline)
+        let deadline = computeDeadline(seconds: current.announceTimerSeconds)
+        let expectedCount = gs.tiebreakBoards.count
+
+        await mutateGameState(when: { $0.tiebreakBoards.count == expectedCount }) { state in
+            state.tiebreakBoards.append(tb)
+            state.phase = .tiebreakAnnouncing
+            state.announceDeadline = deadline
+        }
     }
 
-    /// Host : évalue le tie-break courant. Si winner unique → finalise le parent.
-    /// Si re-split → enter un round suivant. Si plus de pool → arbitraire.
+    /// Host : évalue le tie-break courant.
     private func revealTiebreakBoard() async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
+        guard role == .host, let current = room, let gs = current.gameState else { return }
         guard gs.phase == .tiebreakAnnouncing else { return }
-        announceTimerTask?.cancel()
-        announceTimerTask = nil
         guard var tb = gs.tiebreakBoards.last,
               let parentResult = gs.boardResults[tb.parentBoardIdx],
               let catId = parentResult.winningCategoryId,
               let lockedCat = HandCategory.from(id: catId) else { return }
 
         let tbCards = tb.cards
-
-        // Build per-player
         var perPlayer: [PlayerBoardResult] = []
         for seat in tb.eligibleSeats {
             guard let player = gs.players.first(where: { $0.seat == seat }) else { continue }
@@ -746,14 +1187,12 @@ final class OnlineGameService: ObservableObject {
             ))
         }
 
-        // Détermine winner / re-split
         let validResults = perPlayer.filter { $0.isValid }
         var winnerSeat: Int? = nil
         var isSplit = false
         var splitterSeats: [Int] = []
 
         if validResults.isEmpty {
-            // Personne n'a fait l'annonce valide (cas rare) → on prend le 1er éligible
             winnerSeat = tb.eligibleSeats.first
         } else {
             let sorted = validResults.sorted { a, b in
@@ -781,96 +1220,104 @@ final class OnlineGameService: ObservableObject {
             perPlayer: perPlayer,
             abandoned: false
         )
-        gs.tiebreakBoards[gs.tiebreakBoards.count - 1] = tb
-        gs.phase = .tiebreakReveal
-        current.gameState = gs
-        room = current
-        log("revealTiebreak: parent=\(tb.parentBoardIdx) round=\(tb.round) winner=\(String(describing: winnerSeat)) split=\(isSplit)")
-        await broadcastSnapshot()
+        let resolved = tb
+        let index = gs.tiebreakBoards.count - 1
 
-        // Pause pour laisser voir le résultat
-        try? await Task.sleep(nanoseconds: 4_000_000_000)
+        await mutateGameState(when: {
+            $0.phase == .tiebreakAnnouncing
+            && $0.tiebreakBoards.count == index + 1
+            && $0.tiebreakBoards[index].result == nil
+        }) { state in
+            state.tiebreakBoards[index] = resolved
+            state.phase = .tiebreakReveal
+            state.announceDeadline = nil
+        }
+    }
 
-        if isSplit {
-            // Re-tie-break avec les nouveaux splitters
+    /// Après la pause de `tiebreakReveal` : re-split ou finalisation du parent.
+    private func advanceAfterTiebreakReveal(expectedIndex: Int) async {
+        guard role == .host, let gs = room?.gameState else { return }
+        guard gs.phase == .tiebreakReveal else { return }
+        guard gs.tiebreakBoards.count == expectedIndex + 1,
+              let tb = gs.tiebreakBoards.last,
+              let result = tb.result else { return }
+        if result.isSplit {
             await enterTiebreak(parentBoardIdx: tb.parentBoardIdx,
-                                eligibleSeats: splitterSeats,
+                                eligibleSeats: result.splitterSeats,
                                 round: tb.round + 1)
-        } else if let winner = winnerSeat {
+        } else if let winner = result.winnerSeat {
             await finalizeParentBoard(parentBoardIdx: tb.parentBoardIdx, winnerSeat: winner)
         }
     }
 
-    /// Host : applique le résultat du tie-break au board parent (set winnerSeat,
-    /// applique le scoring) et avance à la phase suivante.
+    /// Host : applique le résultat du tie-break au board parent.
     private func finalizeParentBoard(parentBoardIdx: Int, winnerSeat: Int) async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
+        guard role == .host, let gs = room?.gameState else { return }
         guard var parentResult = gs.boardResults[parentBoardIdx] else { return }
         parentResult.winnerSeat = winnerSeat
         parentResult.isSplit = false
 
-        // Bug fix : pendant les splits, on lock la catégorie annoncée à celle
-        // du parent (les joueurs ne peuvent pas re-annoncer plus bas). Mais
-        // pour le SCORING, on doit utiliser la VRAIE meilleure main du gagnant
-        // sur le board de split — si l'annonce parent était une "suite" et que
-        // le gagnant fait en réalité un "carré" sur le tie-break, il doit
-        // toucher × 8 pas × 1.
+        // Le scoring utilise la VRAIE meilleure main du gagnant sur le board de
+        // split : si l'annonce parent était une suite et qu'il fait un carré,
+        // il touche ×8 et pas ×1.
         if let lastTb = gs.tiebreakBoards.last,
            let winnerHole = gs.hands[winnerSeat],
            let best = HandEvaluator.evaluateBest(winnerHole + lastTb.cards) {
             let upgradedCat = best.category
             if upgradedCat.multi > parentResult.finalMulti {
-                log("finalizeParentBoard: upgrading multi from ×\(parentResult.finalMulti) (\(parentResult.winningCategoryId ?? "?")) → ×\(upgradedCat.multi) (\(upgradedCat.id)) — winner's real best hand")
+                log("finalizeParentBoard: multi ×\(parentResult.finalMulti) → ×\(upgradedCat.multi)")
                 parentResult.winningCategoryId = upgradedCat.id
                 parentResult.finalMulti = upgradedCat.multi
             }
         }
 
-        gs.boardResults[parentBoardIdx] = parentResult
-        applyBoardScoring(gs: &gs, result: parentResult)
-        gs.phase = .boardReveal
-        current.gameState = gs
-        room = current
-        log("finalizeParentBoard: parent=\(parentBoardIdx) → winner seat=\(winnerSeat)")
-        await broadcastSnapshot()
-
-        try? await Task.sleep(nanoseconds: 2_500_000_000)
-        await advanceAfterReveal()
-    }
-
-    /// Host : après un reveal de board, on passe au board suivant (annonces) ou
-    /// on termine la manche. Les cartes communautaires sont déjà toutes
-    /// dévoilées avant l'annonce du board 1 — on ne révèle rien ici.
-    func advanceAfterReveal() async {
-        guard role == .host, var current = room, var gs = current.gameState else { return }
-        guard gs.phase == .boardReveal else { return }
-        if gs.currentBoard < 2 {
-            gs.currentBoard += 1
-            current.gameState = gs
-            room = current
-            await broadcastSnapshot()
-
-            try? await Task.sleep(nanoseconds: Self.nextBoardAnnouncePause)
-            await enterAnnouncing()
-        } else {
-            // Fin de la manche : full-board bonus si applicable, puis on bascule
-            // en .mancheEnd pour afficher le récap et débloquer "Manche suivante".
-            applyFullBoardBonus(gs: &gs)
-            gs.phase = .mancheEnd
-            // Archive locale de la manche pour le sheet "Solde & historique".
-            let archive = buildMancheArchive(gs: gs)
-            current.pastManches.append(archive)
-            current.gameState = gs
-            room = current
-            await broadcastSnapshot()
-            // Persistance Supabase : crée la `games` (1ère manche) puis insère
-            // la manche + manche_results + applique les balances pairwise.
-            await recordMancheToSupabase()
+        let finalResult = parentResult
+        await mutateGameState(when: {
+            ($0.phase == .tiebreakReveal || $0.phase == .tiebreakAnnouncing)
+            && $0.boardResults[parentBoardIdx]?.winnerSeat == nil
+        }) { state in
+            state.boardResults[parentBoardIdx] = finalResult
+            self.applyBoardScoring(gs: &state, result: finalResult)
+            state.phase = .boardReveal
+            state.announceDeadline = nil
         }
     }
 
-    /// Construit l'archive d'une manche terminée (delta + boards remportés
-    /// + multis + nombre de joueurs actifs).
+    // MARK: - Enchaînement des boards / fin de manche
+
+    /// Host : après le reveal du board `expectedBoard`, on passe au suivant ou
+    /// on termine la manche. Idempotent.
+    func advanceAfterReveal(expectedBoard: Int) async {
+        guard role == .host, let gs = room?.gameState else { return }
+        guard gs.phase == .boardReveal, gs.currentBoard == expectedBoard else { return }
+        guard gs.boardResults.indices.contains(expectedBoard),
+              gs.boardResults[expectedBoard] != nil else { return }
+
+        if expectedBoard < 2 {
+            await mutateGameState(when: {
+                $0.phase == .boardReveal && $0.currentBoard == expectedBoard
+            }) { state in
+                state.currentBoard += 1
+            }
+        } else {
+            await mutateGameState(when: {
+                $0.phase == .boardReveal && $0.currentBoard == 2
+            }) { state in
+                self.applyFullBoardBonus(gs: &state)
+                state.phase = .mancheEnd
+            }
+            // Archive locale de la manche pour le sheet « Solde & historique ».
+            if let updated = room?.gameState, updated.phase == .mancheEnd {
+                let archive = buildMancheArchive(gs: updated)
+                await mutate { room in
+                    guard !room.pastManches.contains(where: { $0.mancheNumber == archive.mancheNumber }) else { return }
+                    room.pastManches.append(archive)
+                }
+            }
+        }
+    }
+
+    /// Construit l'archive d'une manche terminée.
     private func buildMancheArchive(gs: OnlineGameState) -> MancheArchive {
         var perPlayerDelta: [Int: Double] = [:]
         var boardsWon: [Int: [Int]] = [:]
@@ -900,7 +1347,7 @@ final class OnlineGameService: ObservableObject {
     // MARK: - Scoring (RULES.md)
 
     /// Score d'un board : gagnant +prix×multi×(N-1), chaque autre joueur actif
-    /// paie prix×multi. Skip/forfeit comptent comme "loser" (paient quand même).
+    /// paie prix×multi. Skip/forfeit comptent comme « loser ».
     private func applyBoardScoring(gs: inout OnlineGameState, result: BoardResult) {
         guard !result.abandoned, let winnerSeat = result.winnerSeat else { return }
         let prix = gs.linePrice
@@ -921,11 +1368,9 @@ final class OnlineGameService: ObservableObject {
                 gs.players[i].score -= loserCost
             }
         }
-        log("scoring board \(result.board+1): winner seat=\(winnerSeat) +\(winnerGain), losers -\(loserCost)")
     }
 
-    /// Bonus "Full Board" : si un même joueur a gagné les 3 boards (split compte
-    /// pour le tie-break gagnant) → +prix×(N-1), chaque autre paie prix×1.
+    /// Bonus « Full Board » : même joueur sur les 3 boards → +prix×(N-1).
     private func applyFullBoardBonus(gs: inout OnlineGameState) {
         let winners = gs.boardResults.compactMap { $0?.winnerSeat }
         guard winners.count == 3, Set(winners).count == 1, let fbWinner = winners.first else {
@@ -949,228 +1394,33 @@ final class OnlineGameService: ObservableObject {
             }
         }
         gs.fullBoardWinnerSeat = fbWinner
-        log("FULL BOARD bonus: seat=\(fbWinner) +\(bonus)")
     }
 
-    // MARK: - Connectivity : forfeit + host transfer (Realtime presence)
+    // MARK: - Persistance Supabase (record_manche, T15)
 
-    /// Traite les `presenceChange.leaves`. Comportement unifié pour host ET guests :
-    ///  - Marque les joueurs comme déconnectés + forfait pour la manche courante
-    ///    + wantsToSpectate=true pour les manches suivantes (le solde reste).
-    ///  - Si c'est l'hôte qui part : élection du nouvel hôte (plus petit seat
-    ///    parmi les joueurs actifs+connectés). Le nouvel hôte reprend la phase
-    ///    courante via `resumeFromCurrentPhase`.
-    private func handlePresenceLeaves(_ leaves: [String: PresenceV2]) async {
-        guard var current = room else { return }
-        let myId = myUserIdCache
-
-        var hostLeft = false
-        var anyChange = false
-
-        for (_, presence) in leaves {
-            guard case .string(let uidStr) = presence.state["user_id"],
-                  let userId = UUID(uuidString: uidStr) else { continue }
-            if userId == myId { continue }
-
-            if userId == current.hostUserId {
-                hostLeft = true
-            }
-
-            if var gs = current.gameState,
-               let i = gs.players.firstIndex(where: { $0.userId == userId }) {
-                if gs.players[i].connected {
-                    gs.players[i].connected = false
-                    anyChange = true
-                }
-                let inLiveManche = gs.phase != .mancheEnd
-                if inLiveManche && gs.players[i].inManche && gs.players[i].forfeitFromBoard == nil {
-                    gs.players[i].forfeitFromBoard = gs.currentBoard
-                    log("forfeit: seat=\(gs.players[i].seat) (\(uidStr.prefix(8))) from board \(gs.currentBoard + 1)")
-                    anyChange = true
-                }
-                // Retire des manches suivantes (tant qu'il n'a pas explicitement
-                // rejoint via le popover spectateurs).
-                if !gs.players[i].wantsToSpectate {
-                    gs.players[i].wantsToSpectate = true
-                    anyChange = true
-                }
-                current.gameState = gs
-            }
-        }
-
-        if anyChange {
-            room = current
-        }
-
-        if hostLeft && role != .host {
-            await electNewHost()
-            return
-        }
-
-        if role == .host {
-            if anyChange {
-                await broadcastSnapshot()
-                await checkAutoRevealAfterDisconnect()
-            }
-        }
-    }
-
-    /// Si un forfait débloque le reveal (tous les remaining ont soumis),
-    /// on déclenche immédiatement pour ne pas rester bloqué.
-    private func checkAutoRevealAfterDisconnect() async {
-        guard role == .host, let gs = room?.gameState else { return }
-        if gs.phase == .announcing {
-            let eligible = eligibleSeats(in: gs)
-            if Set(gs.submissions.keys).isSuperset(of: eligible) {
-                await revealBoard()
-            }
-        } else if gs.phase == .tiebreakAnnouncing, let tb = gs.tiebreakBoards.last {
-            let stillEligible = tb.eligibleSeats.filter { seat in
-                guard let p = gs.players.first(where: { $0.seat == seat }) else { return false }
-                return p.forfeitFromBoard == nil && p.connected
-            }
-            let submitted = Set(tb.submissions.keys)
-            if submitted.isSuperset(of: Set(stillEligible)) {
-                await revealTiebreakBoard()
-            }
-        }
-    }
-
-    // MARK: - Host election + claim
-
-    /// Quand l'host disparaît : on élit le candidat de plus petit seat (parmi
-    /// les joueurs encore actifs + connectés). Si c'est moi → je prends la main.
-    private func electNewHost() async {
-        guard let myId = myUserIdCache, let current = room, let gs = current.gameState else { return }
-        // 1) Priorité : un joueur actif et connecté (autre que l'ex-hôte).
-        let active = gs.players
-            .filter { $0.inManche && $0.connected && $0.userId != current.hostUserId }
-            .sorted { $0.seat < $1.seat }
-        // 2) Sinon : n'importe quel spectateur connecté (participant), pour
-        //    éviter une partie figée si tous les joueurs actifs sont déco.
-        let spectatorFallback = current.participants
-            .filter { $0.userId != current.hostUserId }
-            .map { p -> (UUID, String) in (p.userId, p.displayName) }
-        let newHost: (userId: UUID, displayName: String)?
-        if let a = active.first {
-            newHost = (a.userId, a.displayName)
-        } else if let s = spectatorFallback.first {
-            newHost = s
-        } else {
-            newHost = nil
-        }
-        guard let newHost else {
-            log("electNewHost: aucun candidat, partie en attente")
-            // On est seul·e : informe l'UI pour éviter un état "figé sans raison".
-            lastError = "Hôte déconnecté — aucun autre joueur disponible."
-            return
-        }
-        log("electNewHost: candidate = \(newHost.displayName) (\(newHost.userId.uuidString.prefix(8)))")
-        if newHost.userId == myId {
-            await becomeHost(via: "election after host disconnect")
-        }
-        // Sinon : on attend que ce candidat broadcast le snapshot avec son
-        // hostUserId, on switchera nos rôles en réception.
-    }
-
-    /// Prend explicitement le rôle hôte, broadcast un snapshot mettant à jour
-    /// `hostUserId` et `participants.isHost`, et reprend la phase en cours.
-    private func becomeHost(via reason: String) async {
-        guard let myId = myUserIdCache, var current = room else { return }
-        role = .host
-        current.hostUserId = myId
-        for i in 0..<current.participants.count {
-            current.participants[i].isHost = (current.participants[i].userId == myId)
-        }
-        room = current
-        log("becomeHost: \(reason)")
-        await broadcastSnapshot()
-        await resumeFromCurrentPhase()
-        // Garantit que le heartbeat tourne (idempotent — restart si déjà actif).
-        startTouchActiveLoop()
-    }
-
-    /// Le nouvel hôte (élu ou reçu via snapshot) doit faire avancer la phase
-    /// si on était au milieu d'une animation côté ex-hôte (community reveal,
-    /// délai de boardReveal, etc.).
-    private func resumeFromCurrentPhase() async {
-        guard role == .host, let gs = room?.gameState else { return }
-        log("resumeFromCurrentPhase: phase=\(gs.phase.rawValue)")
-        switch gs.phase {
-        case .dealing, .flop, .turn, .river:
-            await revealCommunityProgressively()
-        case .announcing, .tiebreakAnnouncing:
-            // Le timer broadcast a une deadline absolue → on re-schedule local
-            scheduleAnnounceTimerIfNeeded(gs.announceDeadline)
-        case .boardReveal:
-            try? await Task.sleep(nanoseconds: 4_000_000_000)
-            await advanceAfterReveal()
-        case .tiebreakReveal:
-            try? await Task.sleep(nanoseconds: 3_500_000_000)
-            guard let tb = gs.tiebreakBoards.last, let result = tb.result else { return }
-            if result.isSplit {
-                await enterTiebreak(parentBoardIdx: tb.parentBoardIdx,
-                                    eligibleSeats: result.splitterSeats,
-                                    round: tb.round + 1)
-            } else if let winner = result.winnerSeat {
-                await finalizeParentBoard(parentBoardIdx: tb.parentBoardIdx, winnerSeat: winner)
-            }
-        case .mancheEnd:
-            break // attendre que le nouvel hôte tape "Manche suivante"
-        }
-    }
-
-    /// Avant de passer en spectateur, l'host transfère son rôle au prochain
-    /// candidat actif. Le snapshot broadcast reflète le nouveau hostUserId →
-    /// le candidat claim son rôle en réception.
-    private func transferHostBeforeSpectating() async {
-        guard role == .host, let myId = myUserIdCache, var current = room,
-              let gs = current.gameState else { return }
-        let candidates = gs.players
-            .filter { $0.inManche && $0.connected && $0.userId != myId }
-            .sorted { $0.seat < $1.seat }
-        guard let newHost = candidates.first else {
-            log("transferHostBeforeSpectating: aucun candidat, je reste hôte")
-            return
-        }
-        current.hostUserId = newHost.userId
-        for i in 0..<current.participants.count {
-            current.participants[i].isHost = (current.participants[i].userId == newHost.userId)
-        }
-        room = current
-        await broadcastSnapshot()
-        role = .guest
-        log("transferHostBeforeSpectating: rôle transféré à \(newHost.displayName)")
-    }
-
-    // MARK: - Persistance Supabase (record_manche RPC)
-
-    /// Host uniquement : envoie la manche au RPC record_manche. Crée la game
-    /// à la 1ère manche, ré-utilise cloudGameId ensuite. Le RPC dérive aussi
-    /// les balances pairwise via le trigger _apply_balances_for_manche.
+    /// Host : envoie la manche au RPC `record_manche`, avec 3 tentatives et un
+    /// backoff 1/2/4 s. Le RPC est idempotent côté SQL (manche_number + game).
     private func recordMancheToSupabase() async {
-        guard role == .host, var current = room, let gs = current.gameState else { return }
+        guard role == .host, let current = room, let gs = current.gameState else { return }
         guard gs.phase == .mancheEnd else { return }
+        guard !recordedManches.contains(gs.mancheNumber) else { return }
 
         let numActive = gs.players.filter { $0.inManche }.count
-        guard numActive >= 2 else { return }
+        guard numActive >= 2 else {
+            recordedManches.insert(gs.mancheNumber)
+            return
+        }
+        recordedManches.insert(gs.mancheNumber)
 
-        // Participants : on prend l'index dans `participants` comme seat.
         let participants = current.participants.enumerated().map { idx, p in
-            RecordMancheParticipant(
-                seat_index: idx,
-                user_id: p.userId.uuidString,
-                guest_name: nil
-            )
+            RecordMancheParticipant(seat_index: idx, user_id: p.userId.uuidString, guest_name: nil)
         }
 
-        // Board results : on sérialise les 3 boards + les tie-breaks groupés sous
-        // la clé du parent (pour traçabilité). On garde un format simple jsonb.
         let boardResults: [RecordMancheBoardResult] = (0..<3).compactMap { i in
             guard let r = gs.boardResults[i] else {
                 return RecordMancheBoardResult(board: i, winner_seat: nil,
-                                                category_id: nil, multi: 1,
-                                                is_split: false, abandoned: true)
+                                               category_id: nil, multi: 1,
+                                               is_split: false, abandoned: true)
             }
             return RecordMancheBoardResult(
                 board: r.board,
@@ -1182,33 +1432,26 @@ final class OnlineGameService: ObservableObject {
             )
         }
 
-        // Results per seat : delta = score actuel - score initial de la manche.
         let resultsPerSeat: [RecordMancheResultPerSeat] = gs.players.map { p in
             let initial = gs.initialScores[p.seat] ?? 0
-            let delta = p.score - initial
-            // Boards remportés par ce joueur cette manche
             let boardsWon = gs.boardResults.compactMap { r -> Int? in
                 guard let r else { return nil }
                 return r.winnerSeat == p.seat ? r.board : nil
             }
             return RecordMancheResultPerSeat(
                 seat_index: p.seat,
-                delta: delta,
+                delta: p.score - initial,
                 boards_won_json: boardsWon
             )
         }
-
-        let settings = RecordMancheSettings(
-            flash_mode: current.flashMode,
-            announce_timer_seconds: current.announceTimerSeconds
-        )
 
         let params = RecordMancheParams(
             p_game_id: current.cloudGameId?.uuidString,
             p_mode: "online",
             p_line_price: current.linePrice,
             p_currency: "EUR",
-            p_settings_json: settings,
+            p_settings_json: RecordMancheSettings(flash_mode: current.flashMode,
+                                                  announce_timer_seconds: current.announceTimerSeconds),
             p_participants: participants,
             p_manche_number: gs.mancheNumber,
             p_dealer_seat: gs.dealerSeat,
@@ -1218,172 +1461,108 @@ final class OnlineGameService: ObservableObject {
             p_results_per_seat: resultsPerSeat
         )
 
-        do {
-            log("record_manche RPC: manche=\(gs.mancheNumber) gameId=\(current.cloudGameId?.uuidString.prefix(8) ?? "new")")
-            let response = try await client.rpc("record_manche", params: params).execute()
-            // Le RPC renvoie un UUID. PostgREST le sérialise en string JSON.
-            let returnedGameId = try JSONDecoder().decode(UUID.self, from: response.data)
-            if current.cloudGameId == nil {
-                current.cloudGameId = returnedGameId
-                room = current
-                await broadcastSnapshot()
+        var delay: UInt64 = 1_000_000_000
+        for attempt in 1...3 {
+            do {
+                let response = try await client.rpc("record_manche", params: params).execute()
+                let returnedGameId = try JSONDecoder().decode(UUID.self, from: response.data)
+                if current.cloudGameId == nil {
+                    await mutate { room in
+                        guard room.cloudGameId == nil else { return }
+                        room.cloudGameId = returnedGameId
+                    }
+                }
+                log("record_manche OK (essai \(attempt))")
+                return
+            } catch {
+                log("record_manche échec \(attempt)/3 : \(error.localizedDescription)")
+                if attempt == 3 {
+                    // On laisse la manche retentable par le prochain hôte.
+                    recordedManches.remove(gs.mancheNumber)
+                    return
+                }
+                try? await Task.sleep(nanoseconds: delay)
+                delay *= 2
             }
-            log("record_manche OK gameId=\(returnedGameId.uuidString.prefix(8))")
-        } catch {
-            log("record_manche FAILED: \(error.localizedDescription)")
-            // Pas de retry — la manche reste affichée localement, on tente la
-            // prochaine manche normalement (cloudGameId reste nil, donc la
-            // prochaine sauvegarde crée la game).
         }
     }
 
-    // MARK: - Lifecycle cloud (ensure + touch)
+    // MARK: - Cycle de vie cloud (ensure + touch)
 
-    /// Host uniquement : crée la game dans Supabase (si encore inexistante)
-    /// ou synchronise ses participants. Appelé à la création du lobby et à
-    /// chaque join d'un nouveau guest. Apparaît immédiatement dans
-    /// l'historique des participants.
+    /// Host (B-0004/B-0005) : l'ancien protocole appelait `ensureGameInCloud` à
+    /// chaque `hello` ; dans la salle durable, les arrivées passent par les
+    /// snapshots. Si l'ensemble des userIds de `room.participants` diffère du
+    /// dernier poussé, on relance `ensure_game_and_participants`.
+    /// Throttle 2 s (sauf `force`), jamais deux appels en parallèle ; un appel
+    /// différé est rattrapé par le snapshot ou le heartbeat suivant.
+    private func syncCloudParticipantsIfNeeded(force: Bool = false) async {
+        guard role == .host, let current = room else { return }
+        let ids = Set(current.participants.map(\.userId))
+        guard ids != cloudSyncedParticipantIds else { return }
+        guard !isEnsuringGame else { return }
+        guard force || Date().timeIntervalSince(lastParticipantsSyncAt) >= 2 else { return }
+        lastParticipantsSyncAt = Date()
+        log("participants changés (\(ids.count)) → ensure_game_and_participants")
+        await ensureGameInCloud()
+    }
+
+    /// Host : crée la `games` Supabase (ou synchronise ses participants).
     private func ensureGameInCloud() async {
-        guard role == .host, var current = room else {
-            log("ensureGameInCloud SKIP — role=\(String(describing: role)) hasRoom=\(room != nil)")
-            return
-        }
+        guard role == .host, let current = room else { return }
+        guard !isEnsuringGame else { return }
+        isEnsuringGame = true
+        defer { isEnsuringGame = false }
+        let sentIds = Set(current.participants.map(\.userId))
 
         let participantsPayload = current.participants.enumerated().map { idx, p in
-            EnsureGameParticipant(
-                seat_index: idx,
-                user_id: p.userId.uuidString,
-                guest_name: nil
-            )
+            EnsureGameParticipant(seat_index: idx, user_id: p.userId.uuidString, guest_name: nil)
         }
-        let settings = RecordMancheSettings(
-            flash_mode: current.flashMode,
-            announce_timer_seconds: current.announceTimerSeconds
-        )
         let params = EnsureGameParams(
             p_game_id: current.cloudGameId?.uuidString,
             p_mode: "online",
             p_line_price: current.linePrice,
             p_currency: "EUR",
-            p_settings_json: settings,
+            p_settings_json: RecordMancheSettings(flash_mode: current.flashMode,
+                                                  announce_timer_seconds: current.announceTimerSeconds),
             p_participants: participantsPayload
         )
-        log("ensure_game CALL — gameId=\(current.cloudGameId?.uuidString.prefix(8) ?? "nil") participants=\(participantsPayload.count)")
         do {
-            let response = try await client.rpc(
-                "ensure_game_and_participants", params: params
-            ).execute()
+            let response = try await client.rpc("ensure_game_and_participants", params: params).execute()
             let returnedGameId = try JSONDecoder().decode(UUID.self, from: response.data)
+            cloudSyncedParticipantIds = sentIds
             if current.cloudGameId == nil {
-                current.cloudGameId = returnedGameId
-                room = current
-                await broadcastSnapshot()
-                log("ensure_game CREATED \(returnedGameId.uuidString.prefix(8))")
-            } else {
-                log("ensure_game SYNCED \(returnedGameId.uuidString.prefix(8))")
+                await mutate { room in
+                    guard room.cloudGameId == nil else { return }
+                    room.cloudGameId = returnedGameId
+                }
             }
         } catch {
-            log("ensure_game FAILED: \(error.localizedDescription) — \(error)")
+            log("ensure_game FAILED: \(error.localizedDescription)")
         }
     }
 
-    /// Démarre le heartbeat qui bump `last_active_at` côté Supabase toutes
-    /// les `touchInterval` secondes. Renouvelle l'ancien Task si déjà actif.
+    /// Bump `last_active_at` toutes les 30 s (historique « En cours »).
     private func startTouchActiveLoop() {
-        let wasActive = touchActiveTask != nil
         touchActiveTask?.cancel()
-        log("startTouchActiveLoop (renewed=\(wasActive)) every \(Int(Self.touchInterval))s")
         touchActiveTask = Task { [weak self] in
-            guard let self else { return }
             while !Task.isCancelled {
+                guard let self else { return }
                 await self.touchActiveOnce()
                 try? await Task.sleep(nanoseconds: UInt64(Self.touchInterval * 1_000_000_000))
             }
         }
     }
 
-    /// Un appel `touch_game_active`. Silencieux en cas d'erreur (best-effort).
     private func touchActiveOnce() async {
-        guard let gameId = room?.cloudGameId else {
-            log("touch_game_active SKIP — no cloudGameId")
-            return
-        }
+        guard let gameId = room?.cloudGameId else { return }
         struct TouchParams: Encodable { let p_game_id: String }
-        do {
-            _ = try await client.rpc(
-                "touch_game_active",
-                params: TouchParams(p_game_id: gameId.uuidString)
-            ).execute()
-            #if DEBUG
-            log("touch_game_active OK \(gameId.uuidString.prefix(8))")
-            #endif
-        } catch {
-            log("touch_game_active FAILED: \(error.localizedDescription)")
-        }
+        _ = try? await client.rpc("touch_game_active",
+                                  params: TouchParams(p_game_id: gameId.uuidString)).execute()
     }
 
-    /// Host : démarre la manche suivante. Rotation du donneur, conservation des scores.
-    func startNextManche() async {
-        guard role == .host, var current = room else { return }
-        guard let gs = current.gameState else { return }
-        guard gs.phase == .mancheEnd else {
-            log("startNextManche: ignoré (phase=\(gs.phase.rawValue))")
-            return
-        }
-        log("startNextManche: from manche \(gs.mancheNumber)")
+    // MARK: - Utilitaires
 
-        // Spectateurs : on récupère les préférences durables de chaque seat.
-        let spectatorSeats = Set(gs.players.filter { $0.wantsToSpectate }.map { $0.seat })
-
-        // Rotation du donneur : on passe au seat suivant, en sautant les
-        // spectateurs. Si tout le monde sauf un est spectateur on stoppe.
-        let n = gs.players.count
-        var nextDealer = (gs.dealerSeat + 1) % n
-        var safety = 0
-        while spectatorSeats.contains(nextDealer) && safety < n {
-            nextDealer = (nextDealer + 1) % n
-            safety += 1
-        }
-        guard !spectatorSeats.contains(nextDealer) else {
-            log("startNextManche: pas assez de joueurs actifs")
-            return
-        }
-
-        // Construit le nouvel état avec les mêmes participants
-        guard var newState = OnlineGameService.buildInitialGameState(
-            mancheNumber: gs.mancheNumber + 1,
-            participants: current.participants,
-            dealerSeat: nextDealer,
-            linePrice: current.linePrice,
-            spectatorSeats: spectatorSeats
-        ) else {
-            log("startNextManche: build failed (peut-être pas assez de joueurs)")
-            return
-        }
-
-        // Carry-over des scores depuis la manche précédente
-        let oldScores = Dictionary(uniqueKeysWithValues: gs.players.map { ($0.seat, $0.score) })
-        for i in 0..<newState.players.count {
-            let seat = newState.players[i].seat
-            newState.players[i].score = oldScores[seat] ?? 0
-        }
-        // Snapshot des scores au début de la manche (utilisé pour calculer
-        // les deltas dans le mancheEndPanel et dans record_manche).
-        newState.initialScores = Dictionary(uniqueKeysWithValues: newState.players.map { ($0.seat, $0.score) })
-
-        current.gameState = newState
-        room = current
-        await broadcastSnapshot()
-        log("startNextManche: state broadcast, manche \(newState.mancheNumber) dealer=\(nextDealer)")
-
-        // Pause dramatique puis reveal community
-        try? await Task.sleep(nanoseconds: 3_000_000_000)
-        await revealCommunityProgressively()
-    }
-
-    // MARK: - Utilities
-
-    /// Liste des seats encore éligibles à soumettre une annonce sur le board courant.
+    /// Sièges encore éligibles à soumettre une annonce sur le board courant.
     private func eligibleSeats(in gs: OnlineGameState) -> Set<Int> {
         var result: Set<Int> = []
         for p in gs.players where p.inManche {
@@ -1394,11 +1573,10 @@ final class OnlineGameService: ObservableObject {
         return result
     }
 
-    // MARK: - Game state construction (host)
+    // MARK: - Construction de l'état initial (host)
 
     /// Construit l'état initial d'une manche : seats fixes, deck mélangé,
-    /// mains distribuées, community pré-piochée (flop visible, turn/river
-    /// pending), brûles cachées.
+    /// mains distribuées, community pré-piochée, brûles cachées.
     static func buildInitialGameState(
         mancheNumber: Int,
         participants: [OnlineParticipant],
@@ -1406,8 +1584,6 @@ final class OnlineGameService: ObservableObject {
         linePrice: Double,
         spectatorSeats: Set<Int> = []
     ) -> OnlineGameState? {
-        // Players = participants triés par ordre de connexion, seat = index.
-        // Les spectateurs sont marqués inManche=false, ne reçoivent pas de cartes.
         let players = participants.enumerated().map { idx, p in
             let isSpect = spectatorSeats.contains(idx)
             return GamePlayer(
@@ -1421,9 +1597,8 @@ final class OnlineGameService: ObservableObject {
         let target = OnlineDealer.cardsPerPlayer(activeCount: activeSeats.count)
         guard target > 0 else { return nil }
 
-        // Ordre de distribution : seulement les seats actifs, en partant de
-        // celui après le donneur (dealer servi en dernier).
         let n = players.count
+        guard n > 0 else { return nil }
         let dealOrderAll: [Int] = (1...n).map { (dealerSeat + $0) % n }
         let dealOrder = dealOrderAll.filter { activeSeats.contains($0) }
 
@@ -1455,458 +1630,11 @@ final class OnlineGameService: ObservableObject {
             excludedThisBoard: [],
             tiebreakBoards: []
         )
-        // Snapshot des scores au début de la manche (manche 1 : tout le monde
-        // à 0). Permet de calculer le delta de la manche dans le mancheEndPanel
-        // et le payload de record_manche.
         state.initialScores = Dictionary(
             uniqueKeysWithValues: players.map { ($0.seat, $0.score) }
         )
         return state
     }
-
-    // MARK: - Channel lifecycle
-
-    private func openChannel(code: String, myUserId: UUID, myDisplayName: String) async {
-        phase = .connecting
-        pendingChannelCode = code
-        myUserIdCache = myUserId
-        lastError = nil
-        let name = "online:\(code)"
-        log("openChannel name=\(name)")
-
-        // Refresh la session AVANT d'ouvrir le channel : les JWT anonymous
-        // expirent en 1h et le SDK Realtime hang silencieusement si le token
-        // est pourri. Refresh est best-effort — si ça échoue (pas de session
-        // du tout), on tente un sign-in anonymous en fallback.
-        do {
-            _ = try await client.auth.refreshSession()
-            log("openChannel: session refreshed")
-        } catch {
-            log("openChannel: refresh failed (\(error.localizedDescription)) — trying anonymous sign-in")
-            do {
-                try await client.auth.signInAnonymously()
-                log("openChannel: anonymous sign-in OK")
-            } catch {
-                log("openChannel: anonymous sign-in FAILED \(error.localizedDescription)")
-                await finishConnectFailure(message: "Connexion impossible. Vérifiez votre connexion internet et réessayez.")
-                return
-            }
-        }
-
-        // Si on a déjà un channel ouvert (re-join), on nettoie d'abord
-        if let existing = channel {
-            log("openChannel: closing previous channel")
-            await existing.unsubscribe()
-        }
-
-        let ch = client.realtimeV2.channel(name)
-        self.channel = ch
-        log("openChannel: initial status = \(ch.status)")
-
-        // Bind les broadcasts AVANT subscribe (sinon on peut rater le 1er message)
-        listenerTask?.cancel()
-        listenerTask = Task { [weak self] in
-            guard let self else { return }
-            self.log("listenerTask: started, waiting for messages")
-            for await msg in ch.broadcastStream(event: "msg") {
-                await self.handleIncoming(rawMessage: msg, myUserId: myUserId, myDisplayName: myDisplayName)
-            }
-            self.log("listenerTask: broadcastStream ended")
-        }
-
-        // Observe les changements de statut du channel (joined / joining / closed / errored)
-        subscribeTask?.cancel()
-        subscribeTask = Task { [weak self] in
-            guard let self else { return }
-            for await status in ch.statusChange {
-                self.log("channel status → \(status)")
-                await MainActor.run { self.channelStatusLabel = "\(status)" }
-            }
-            self.log("channel statusChange stream ended")
-        }
-
-        do {
-            log("openChannel: calling subscribeWithError…")
-            try await Self.withTimeout(seconds: 15) {
-                try await ch.subscribeWithError()
-            }
-            log("openChannel: subscribe OK")
-            phase = .lobby
-
-            // Track sa propre presence : permet au host de détecter les
-            // déconnexions des guests (via presenceChange leaves).
-            do {
-                let state: JSONObject = ["user_id": .string(myUserId.uuidString)]
-                try await ch.track(state: state)
-                log("presence: tracked self")
-            } catch {
-                log("presence: track failed: \(error.localizedDescription)")
-            }
-
-            // Listener presence — host only s'en sert pour le forfeit auto.
-            presenceTask?.cancel()
-            presenceTask = Task { [weak self] in
-                guard let self else { return }
-                for await action in ch.presenceChange() {
-                    if !action.leaves.isEmpty {
-                        await self.handlePresenceLeaves(action.leaves)
-                    }
-                }
-            }
-
-            // Si host : on est seul pour l'instant, rien d'autre à faire.
-            // Si guest : on annonce notre arrivée, le host répondra avec un snapshot.
-            // On envoie en boucle (retry) jusqu'à recevoir le snapshot ou abandonner —
-            // ça évite la race "guest envoie hello avant que le host soit pleinement
-            // joint au channel" qui laissait le lobby bloqué sur 'Préparation…'.
-            if role == .guest {
-                startGuestHelloRetry(myUserId: myUserId, myDisplayName: myDisplayName)
-            }
-        } catch is ChannelTimeoutError {
-            log("openChannel: subscribe TIMEOUT after 15s")
-            await ch.unsubscribe()
-            await finishConnectFailure(message: "Le salon n'a pas pu être ouvert (délai dépassé). Vérifiez votre connexion et réessayez.")
-        } catch {
-            log("openChannel: subscribe FAILED \(error.localizedDescription)")
-            await ch.unsubscribe()
-            await finishConnectFailure(message: "Connexion au salon impossible : \(error.localizedDescription)")
-        }
-    }
-
-    /// Cleanup partagé entre tous les chemins d'échec de openChannel :
-    /// remet le service en état "idle" propre pour que l'UI puisse afficher
-    /// un retour clair sans laisser de room/role/channel zombie.
-    private func finishConnectFailure(message: String) async {
-        lastError = message
-        phase = .idle
-        pendingChannelCode = nil
-        // Host : on avait set room+role avant openChannel. Côté guest, room
-        // est encore nil. Dans les deux cas on nettoie pour que la nav remonte
-        // proprement à la page entry.
-        role = nil
-        room = nil
-        listenerTask?.cancel()
-        subscribeTask?.cancel()
-        presenceTask?.cancel()
-        helloRetryTask?.cancel()
-        channel = nil
-        helloAttempt = 0
-        // On NE clear PAS channelStatusLabel : l'UI s'en sert comme diag
-        // ("Channel: errored", "Channel: closed", …) sous le message d'erreur.
-    }
-
-    // MARK: - Timeout helper
-
-    private struct ChannelTimeoutError: Error {}
-
-    /// Exécute `op` avec un timeout dur. Si `op` ne renvoie pas dans `seconds`,
-    /// jette `ChannelTimeoutError`. Le SDK Supabase Realtime n'a pas de
-    /// timeout interne sur `subscribeWithError`, d'où ce wrapper.
-    private static func withTimeout(
-        seconds: Double,
-        operation: @escaping @Sendable () async throws -> Void
-    ) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                try await operation()
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                throw ChannelTimeoutError()
-            }
-            _ = try await group.next()
-            group.cancelAll()
-        }
-    }
-
-    /// Guest : (re)envoie helloFromGuest jusqu'à recevoir un snapshot, max ~8s.
-    private func startGuestHelloRetry(myUserId: UUID, myDisplayName: String) {
-        helloRetryTask?.cancel()
-        helloAttempt = 0
-        let maxAttempts = Self.maxHelloAttempts
-        helloRetryTask = Task { [weak self] in
-            guard let self else { return }
-            for attempt in 1...maxAttempts {
-                if Task.isCancelled { return }
-                if self.room != nil {
-                    self.log("guest got snapshot (after \(attempt - 1) retries)")
-                    self.helloAttempt = 0
-                    return
-                }
-                self.helloAttempt = attempt
-                self.log("guest sending helloFromGuest #\(attempt)/\(maxAttempts)")
-                do {
-                    try await self.sendMessage(
-                        .init(kind: .helloFromGuest,
-                              payload: .hello(userId: myUserId, displayName: myDisplayName))
-                    )
-                } catch {
-                    self.log("guest hello send failed: \(error.localizedDescription)")
-                }
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s
-            }
-            if self.room == nil {
-                let code = self.pendingChannelCode ?? "????"
-                self.log("guest gave up after \(maxAttempts) retries, no snapshot for '\(code)'")
-                self.lastError = "Aucun salon trouvé avec le code \(code). Demande à l'hôte de vérifier."
-                self.helloAttempt = 0
-            }
-        }
-    }
-
-    private func sendMessage(_ msg: OnlineMessage) async throws {
-        guard let channel else {
-            log("sendMessage skipped: no channel (kind=\(msg.kind.rawValue))")
-            return
-        }
-        // On encode l'OnlineMessage en JSON string puis on l'enveloppe dans une clé "p".
-        // Plus simple et plus fiable que de mapper récursivement vers AnyJSON.
-        let data = try JSONEncoder().encode(msg)
-        let str = String(data: data, encoding: .utf8) ?? ""
-        log("→ broadcast kind=\(msg.kind.rawValue) bytes=\(data.count)")
-        try await channel.broadcast(event: "msg", message: ["p": .string(str)])
-    }
-
-    private func handleIncoming(rawMessage: [String: AnyJSON],
-                                myUserId: UUID,
-                                myDisplayName: String) async {
-        // Realtime V2 enveloppe les broadcasts au format :
-        //   { "type": "broadcast", "event": "msg", "payload": { "p": "<json>" } }
-        // On extrait notre payload utilisateur (clé "p" nichée dans "payload").
-        // Fallback : si le SDK nous le donne déjà unwrappé, on accepte aussi.
-        let userPayload: [String: AnyJSON]
-        if case .object(let o) = rawMessage["payload"] {
-            userPayload = o
-        } else if rawMessage["p"] != nil {
-            userPayload = rawMessage
-        } else {
-            let keys = rawMessage.keys.sorted().joined(separator: ",")
-            log("← incoming: unexpected shape, top keys=[\(keys)]")
-            return
-        }
-
-        guard case .string(let payloadStr) = userPayload["p"] else {
-            let keys = userPayload.keys.sorted().joined(separator: ",")
-            log("← incoming: missing 'p' in user payload, keys=[\(keys)]")
-            return
-        }
-        guard let data = payloadStr.data(using: .utf8) else {
-            log("← incoming: cannot encode payload as utf8, ignoring")
-            return
-        }
-        let msg: OnlineMessage
-        do {
-            msg = try JSONDecoder().decode(OnlineMessage.self, from: data)
-        } catch {
-            log("← incoming: decode FAILED \(error) — payload=\(payloadStr.prefix(160))")
-            return
-        }
-        log("← kind=\(msg.kind.rawValue)")
-        switch msg.payload {
-        case .hello(let userId, let displayName):
-            // Côté host : on ajoute le guest à la liste, ou marque la reconnexion
-            // si déjà connu.
-            guard role == .host, var current = room else {
-                log("hello IGNORED: role=\(String(describing: role)) room=\(room == nil ? "nil" : "set")")
-                return
-            }
-            if current.participants.contains(where: { $0.userId == userId }) {
-                let wasConnected = current.gameState?.players.first(where: { $0.userId == userId })?.connected ?? true
-                log("hello RECONNECT: \(displayName) (\(userId.uuidString.prefix(8))) — wasConnected=\(wasConnected)")
-                if var gs = current.gameState,
-                   let pIdx = gs.players.firstIndex(where: { $0.userId == userId }) {
-                    if !gs.players[pIdx].connected {
-                        gs.players[pIdx].connected = true
-                        log("  marked seat \(gs.players[pIdx].seat) as reconnected")
-                    }
-                    current.gameState = gs
-                    room = current
-                }
-                await broadcastSnapshot()
-                // Sync DB pour bump last_active_at + repush participants (idempotent UPSERT).
-                await ensureGameInCloud()
-            } else {
-                log("hello NEW guest \(displayName) (\(userId.uuidString.prefix(8))) — adding, status=\(current.status.rawValue)")
-                current.participants.append(
-                    OnlineParticipant(userId: userId, displayName: displayName, isHost: false)
-                )
-                // Si la partie est déjà en cours, on N'AJOUTE PAS au gs.players —
-                // il reste spectateur jusqu'à la prochaine manche.
-                room = current
-                await broadcastSnapshot()
-                // Sync le nouveau participant côté Supabase pour qu'il
-                // apparaisse dans son propre historique tout de suite.
-                await ensureGameInCloud()
-            }
-
-        case .snapshot(let snapshot):
-            // Côté guest (ou rejoin) : on prend le snapshot du host
-            if role == .guest {
-                let phaseStr = snapshot.gameState?.phase.rawValue ?? "—"
-                let cloudTag = snapshot.cloudGameId?.uuidString.prefix(8) ?? "nil"
-                log("snapshot received (\(snapshot.participants.count) participants, status=\(snapshot.status.rawValue), phase=\(phaseStr), cloudGameId=\(cloudTag))")
-                let wasNilCloudId = (self.room?.cloudGameId == nil)
-                self.room = snapshot
-                if snapshot.status == .playing {
-                    self.phase = .playing
-                }
-                helloRetryTask?.cancel()
-                // Dès qu'on connaît le cloudGameId, on démarre le heartbeat
-                // local pour qu'on apparaisse en "En cours" dans notre historique.
-                if wasNilCloudId && snapshot.cloudGameId != nil {
-                    startTouchActiveLoop()
-                }
-                // Si le snapshot désigne MON userId comme hôte → je claim le rôle
-                // (cas typique : ex-hôte a déco / passé en spec, m'a transféré).
-                if snapshot.hostUserId == myUserId {
-                    log("snapshot transfers host to me — claiming")
-                    await becomeHost(via: "host transfer via snapshot")
-                }
-            } else if role == .host {
-                // Reçu mon propre broadcast OU un broadcast d'un autre client qui
-                // pense être hôte. Si le snapshot ne me désigne PAS comme hôte,
-                // je me démote.
-                if snapshot.hostUserId != myUserId {
-                    log("snapshot transfers host away from me — demoting to guest")
-                    role = .guest
-                    self.room = snapshot
-                    announceTimerTask?.cancel()
-                }
-            }
-
-        case .leave(let userId):
-            guard role == .host, var current = room else { return }
-            if userId == myUserId { return } // jamais soi-même
-            let name = current.participants.first { $0.userId == userId }?.displayName ?? "?"
-            let phase = current.gameState?.phase.rawValue ?? "—"
-            log("leave received from \(name) (\(userId.uuidString.prefix(8))) — status=\(current.status.rawValue) phase=\(phase)")
-
-            if current.status == .playing, var gs = current.gameState,
-               let i = gs.players.firstIndex(where: { $0.userId == userId }) {
-                // En cours de partie : on GARDE le participant (salon persistant)
-                // mais on le marque comme déconnecté et forfeit pour les boards
-                // restants de la manche. Il pourra revenir via hello.
-                gs.players[i].connected = false
-                if gs.phase != .mancheEnd, gs.players[i].forfeitFromBoard == nil {
-                    gs.players[i].forfeitFromBoard = gs.currentBoard
-                    log("  marked seat \(gs.players[i].seat) as forfeit from board \(gs.currentBoard)")
-                } else {
-                    log("  marked seat \(gs.players[i].seat) as disconnected (mancheEnd or already forfeit)")
-                }
-                current.gameState = gs
-                room = current
-                await broadcastSnapshot()
-                await checkAutoRevealAfterDisconnect()
-            } else {
-                // En lobby (avant 1re manche) ou non-trouvé : on libère le slot.
-                let before = current.participants.count
-                current.participants.removeAll { $0.userId == userId }
-                let after = current.participants.count
-                log("  lobby cleanup : participants \(before) → \(after)")
-                room = current
-                await broadcastSnapshot()
-                // Sync l'état participants côté Supabase pour refléter le départ
-                // (mais on ne supprime pas les game_participants — ils restent
-                // pour préserver la row historique de la personne partie).
-            }
-
-        case .start:
-            log("start received")
-            phase = .playing
-            if var current = room {
-                current.status = .playing
-                room = current
-            }
-
-        case .submitAnnounce(let seat, let submission):
-            // Seul le host traite les soumissions
-            if role == .host {
-                log("submitAnnounce seat=\(seat) category=\(submission.categoryId)")
-                await handleIncomingSubmission(seat: seat, submission: submission)
-            }
-
-        case .setSpectator(let seat, let wantsToSpectate):
-            if role == .host {
-                log("setSpectator request seat=\(seat) wants=\(wantsToSpectate)")
-                await applySpectatorChange(seat: seat, wantsToSpectate: wantsToSpectate)
-            }
-        }
-    }
-
-    private func broadcastSnapshot() async {
-        guard let snapshot = room else { return }
-        let cloudTag = snapshot.cloudGameId?.uuidString.prefix(8) ?? "nil"
-        log("→ broadcast snapshot (status=\(snapshot.status.rawValue), \(snapshot.participants.count) participants, cloudGameId=\(cloudTag))")
-        try? await sendMessage(.init(kind: .roomSnapshot, payload: .snapshot(snapshot)))
-        // Persistance locale du host pour la "Reprendre la partie" banner.
-        if role == .host {
-            persistHostState(snapshot)
-        }
-    }
-
-    // MARK: - Resume banner — host state persisté en UserDefaults
-
-    private static let resumeStorageKey = "online_host_resume_state"
-    private static let resumeMaxAgeSec: TimeInterval = 60 * 60 // 1h
-
-    private func persistHostState(_ room: OnlineRoom) {
-        // On stocke un wrapper { room, savedAt }. Le room JSON inclut tout
-        // (gameState, participants, scores) — ça permet une vraie reprise.
-        guard room.status == .playing else { return }
-        do {
-            let snapshot = ResumeSnapshot(room: room, savedAt: Date())
-            let data = try JSONEncoder().encode(snapshot)
-            UserDefaults.standard.set(data, forKey: Self.resumeStorageKey)
-        } catch {
-            log("persistHostState failed: \(error.localizedDescription)")
-        }
-    }
-
-    private func clearHostState() {
-        UserDefaults.standard.removeObject(forKey: Self.resumeStorageKey)
-    }
-
-    /// API publique pour OnlineRootView : retourne le state persisté du host
-    /// si présent et récent (< 1h). Sinon nil.
-    static func loadResumableHostState() -> OnlineRoom? {
-        guard let data = UserDefaults.standard.data(forKey: resumeStorageKey),
-              let snapshot = try? JSONDecoder().decode(ResumeSnapshot.self, from: data) else {
-            return nil
-        }
-        if Date().timeIntervalSince(snapshot.savedAt) > resumeMaxAgeSec {
-            UserDefaults.standard.removeObject(forKey: resumeStorageKey)
-            return nil
-        }
-        return snapshot.room
-    }
-
-    static func clearResumableHostState() {
-        UserDefaults.standard.removeObject(forKey: resumeStorageKey)
-    }
-
-    /// Host : reprend une partie persistée. Ouvre le channel sur le code
-    /// d'origine, restaure le room state, rebroadcast pour que les guests qui
-    /// se reconnectent reçoivent l'état frais.
-    func resumeAsHost(savedRoom: OnlineRoom, myUserId: UUID, myDisplayName: String) async {
-        log("resumeAsHost: code=\(savedRoom.code) manche=\(savedRoom.gameState?.mancheNumber ?? 0)")
-        self.role = .host
-        self.room = savedRoom
-        self.lastError = nil
-        await openChannel(code: savedRoom.code, myUserId: myUserId, myDisplayName: myDisplayName)
-        // Le snapshot est broadcasté automatiquement quand un guest envoie un hello.
-        // On force aussi un broadcast immédiat pour rafraîchir les guests connectés.
-        await broadcastSnapshot()
-        // Reprend le heartbeat (côté lifecycle Supabase) — la game existait
-        // déjà avec son cloudGameId persisté dans savedRoom.
-        await ensureGameInCloud()
-        startTouchActiveLoop()
-    }
-}
-
-/// Wrapper persisté pour le resume banner.
-private struct ResumeSnapshot: Codable {
-    let room: OnlineRoom
-    let savedAt: Date
 }
 
 // MARK: - RPC record_manche payload types
@@ -1958,8 +1686,7 @@ private struct RecordMancheParams: Encodable {
     }
 
     // ⚠️ encode `null` explicite (pas `encodeIfPresent`) pour que PostgREST
-    // matche la signature à 12 paramètres. Sinon la résolution de la fonction
-    // échoue avec PGRST202 ("function not found in schema cache").
+    // matche la signature à 12 paramètres (sinon PGRST202).
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(p_game_id, forKey: .p_game_id)
@@ -1998,8 +1725,6 @@ private struct EnsureGameParams: Encodable {
              p_settings_json, p_participants
     }
 
-    // Force `null` pour `p_game_id` quand nil — sinon PostgREST ne trouve pas
-    // la fonction à 6 paramètres et renvoie PGRST202.
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(p_game_id, forKey: .p_game_id)

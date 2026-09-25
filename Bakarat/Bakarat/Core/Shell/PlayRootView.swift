@@ -49,8 +49,12 @@ struct PlayRootView: View {
     /// du sheet pour push le détail (redirect direct sur le compteur neuf).
     @State private var pendingCounterPush: UUID? = nil
     @State private var joinCodeOnline: String = ""
-    @State private var resumableRoom: OnlineRoom? = nil
+    /// Code du dernier salon (UserDefaults, < 2 h) dont `room_heartbeat` a
+    /// répondu : on propose de le reprendre.
+    @State private var resumableCode: String? = nil
     @State private var isCreatingGame = false
+    /// Garde-fou : le hook `-autoJoinCode` ne doit jouer qu'une fois.
+    @State private var didAutoJoin = false
 
     private var currency: String { auth.profile?.currency ?? "EUR" }
 
@@ -60,8 +64,8 @@ struct PlayRootView: View {
         NavigationStack(path: $path) {
             List {
                 onlineSection
-                if let resumable = resumableRoom {
-                    resumeSection(resumable)
+                if let code = resumableCode {
+                    resumeSection(code)
                 }
                 counterSection
                 recentSection
@@ -123,17 +127,15 @@ struct PlayRootView: View {
                     .presentationDetents([.large])
                     .presentationDragIndicator(.visible)
             }
-            .onAppear {
-                resumableRoom = OnlineGameService.loadResumableHostState()
-            }
             .onChange(of: path.count) { _, newCount in
                 guard newCount == 0 else { return }
-                resumableRoom = OnlineGameService.loadResumableHostState()
+                resumableCode = OnlineGameService.rememberedRoomCode()
             }
             .task(id: auth.userId) {
                 if let uid = auth.userId {
                     await sessionsService.startLiveUpdates(myUserId: uid)
                 }
+                await bootstrapOnlineEntry()
             }
             .refreshable {
                 if let uid = auth.userId {
@@ -184,6 +186,7 @@ struct PlayRootView: View {
                 )
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("play.createOnline")
             .disabled(isCreatingGame)
             .listRowBackground(Theme.brandGradient)
             .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
@@ -201,6 +204,7 @@ struct PlayRootView: View {
                 )
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("play.joinOnline")
             .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
         } header: {
             Text("Online")
@@ -239,28 +243,30 @@ struct PlayRootView: View {
         .contentShape(Rectangle())
     }
 
-    // MARK: - Resume banner (online only)
+    // MARK: - Reprise d'un salon (online only)
 
+    /// Bannière « Reprendre le salon XXXX ». Le code vient de `UserDefaults`
+    /// (< 2 h) : on rejoint par `room_join`, et si le bail de l'ancien hôte est
+    /// expiré, `room_claim_host` nous rendra l'animation automatiquement.
     @ViewBuilder
-    private func resumeSection(_ room: OnlineRoom) -> some View {
+    private func resumeSection(_ code: String) -> some View {
         Section {
             HStack(spacing: 12) {
                 Image(systemName: "arrow.clockwise.circle.fill")
                     .font(.title2)
                     .foregroundStyle(Theme.brandRed)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Game in progress")
+                    Text("Reprendre le salon")
                         .font(.subheadline.weight(.semibold))
-                    let manche = room.gameState?.mancheNumber ?? 1
-                    Text("Code \(room.code) · Round \(manche)")
+                    Text("Code \(code)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button {
-                    Task { await resumeOnlineGame(room) }
+                    Task { await resumeOnlineGame(code) }
                 } label: {
-                    Text("Resume")
+                    Text("Reprendre")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.white)
                         .padding(.horizontal, 12).padding(.vertical, 6)
@@ -268,8 +274,8 @@ struct PlayRootView: View {
                 }
                 .buttonStyle(.plain)
                 Button {
-                    OnlineGameService.clearResumableHostState()
-                    resumableRoom = nil
+                    OnlineGameService.forgetRoom()
+                    resumableCode = nil
                 } label: {
                     Image(systemName: "xmark")
                         .foregroundStyle(.secondary)
@@ -279,7 +285,7 @@ struct PlayRootView: View {
             }
             .listRowSeparator(.hidden)
         } header: {
-            Text("Resume")
+            Text("Reprise")
         }
     }
 
@@ -332,12 +338,42 @@ struct PlayRootView: View {
 
     // MARK: - Online actions
 
+    /// Au premier affichage : hook `-autoJoinCode` (DEBUG), sinon on vérifie
+    /// qu'un salon mémorisé (< 2 h) répond encore avant de proposer la reprise.
+    private func bootstrapOnlineEntry() async {
+        guard auth.userId != nil else { return }
+        if let code = QALaunchOptions.autoJoinCode, !didAutoJoin {
+            didAutoJoin = true
+            joinCodeOnline = code
+            await joinOnlineGame()
+            return
+        }
+        if QALaunchOptions.autoCreateRoom, !didAutoJoin {
+            didAutoJoin = true
+            await createOnlineGame()
+            return
+        }
+        guard resumableCode == nil, onlineService.room == nil else { return }
+        guard let code = OnlineGameService.rememberedRoomCode() else { return }
+        // On ne propose la reprise que si le salon répond encore.
+        do {
+            _ = try await onlineService.transport.heartbeat(code: code)
+            resumableCode = code
+        } catch {
+            OnlineGameService.forgetRoom()
+        }
+    }
+
     private func createOnlineGame() async {
         guard !isCreatingGame, let uid = auth.userId else { return }
         isCreatingGame = true
         defer { isCreatingGame = false }
         await onlineService.createRoom(myUserId: uid, myDisplayName: displayName())
+        guard let code = onlineService.room?.code else { return }
         path.append(PlayRoute.onlineLobby)
+        #if DEBUG
+        QABotRunner.shared.startIfNeeded(code: code)
+        #endif
     }
 
     private func joinOnlineGame() async {
@@ -347,15 +383,26 @@ struct PlayRootView: View {
             myUserId: uid,
             myDisplayName: displayName()
         )
-        guard ok else { return }
+        guard ok, onlineService.room != nil else { return }
         joinCodeOnline = ""
+        resumableCode = nil
         path.append(PlayRoute.onlineLobby)
     }
 
-    private func resumeOnlineGame(_ room: OnlineRoom) async {
+    /// Reprise = simple `room_join` sur le code mémorisé. Si le bail de l'hôte
+    /// précédent est expiré, `room_claim_host` nous rendra l'animation ; sinon
+    /// on reste guest le temps que le bail tombe.
+    private func resumeOnlineGame(_ code: String) async {
         guard let uid = auth.userId else { return }
-        resumableRoom = nil
-        await onlineService.resumeAsHost(savedRoom: room, myUserId: uid, myDisplayName: displayName())
+        let ok = await onlineService.joinRoom(code: code,
+                                              myUserId: uid,
+                                              myDisplayName: displayName())
+        guard ok, onlineService.room != nil else {
+            OnlineGameService.forgetRoom()
+            resumableCode = nil
+            return
+        }
+        resumableCode = nil
         path.append(PlayRoute.onlineLobby)
     }
 

@@ -17,7 +17,8 @@ struct OnlineLobbyView: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var pendingStart = false
-    @State private var didCallLeave = false
+    /// Confirmation avant de quitter une partie en cours.
+    @State private var showingLeaveConfirm = false
     /// Buffer texte pour le TextField du prix de la ligne (sync bi-directionnelle
     /// avec service.room.linePrice — édité par l'host, lu par les guests).
     @State private var linePriceText: String = ""
@@ -25,9 +26,9 @@ struct OnlineLobbyView: View {
 
     var body: some View {
         // Router : si la partie a démarré → on bascule sur OnlineGameView.
-        // On wrap dans un Group pour que le .onDisappear externe ne fire QUE
-        // lorsque la lobby est vraiment retirée du nav stack (pop), pas quand
-        // on transitionne en interne vers OnlineGameView.
+        // ⚠️ Plus AUCUN `.onDisappear { leave() }` ici (T03b) : changer d'onglet
+        // ne doit jamais faire quitter la partie. On ne part que sur un geste
+        // explicite (bouton « Quitter »).
         Group {
             if service.room?.status == .playing {
                 OnlineGameView(service: service)
@@ -35,13 +36,29 @@ struct OnlineLobbyView: View {
                 lobbyContent
             }
         }
-        .onDisappear { performLeaveIfNeeded() }
+        .roomLifecycle(service)
         .onChange(of: service.phase) { _, newPhase in
-            // Si l'utilisateur tape "Quitter la partie" depuis les settings de
-            // OnlineGameView (qui appelle service.leave), on pop le lobby du
-            // nav stack pour revenir à OnlineRootView.
+            // « Quitter » (ici ou depuis les réglages mi-partie) → on pop le
+            // lobby du nav stack pour revenir à l'accueil.
             if newPhase == .left {
                 dismiss()
+            }
+        }
+    }
+
+    // MARK: - Bannière de connexion / d'hôte
+
+    @ViewBuilder
+    private var connectionBanner: some View {
+        if service.connectionState != .connected || service.isReconnecting {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.mini)
+                Text(service.connectionState == .offline
+                     ? "Hors ligne — reconnexion…"
+                     : "Reconnexion…")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Spacer()
             }
         }
     }
@@ -52,6 +69,9 @@ struct OnlineLobbyView: View {
         List {
             if let room = service.room {
                 codeSection(room.code)
+                if service.connectionState != .connected || service.isReconnecting {
+                    Section { connectionBanner }
+                }
                 settingsSection(room)
                 playersSection(room.participants)
 
@@ -109,12 +129,6 @@ struct OnlineLobbyView: View {
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
-                        if service.helloAttempt > 0 {
-                            Text("Tentative \(service.helloAttempt)/\(OnlineGameService.maxHelloAttempts)")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                        }
                         if let status = service.channelStatusLabel {
                             Text("Channel: \(status)")
                                 .font(.caption2.monospaced())
@@ -128,12 +142,23 @@ struct OnlineLobbyView: View {
                 }
             }
         }
+        .accessibilityIdentifier("lobby.root")
         .listStyle(.insetGrouped)
         .listSectionSpacing(.compact)
         .contentMargins(.top, 4, for: .scrollContent)
         .navigationTitle(service.role == .host ? "Ma partie" : "Salon")
         .navigationBarTitleDisplayMode(.inline)
+        .navigationBarBackButtonHidden(true)
+        .toolbar { leaveToolbarItem }
         .toolbar { startToolbarItem }
+        .confirmationDialog("Quitter la partie ?",
+                            isPresented: $showingLeaveConfirm,
+                            titleVisibility: .visible) {
+            Button("Quitter", role: .destructive) { performLeave() }
+            Button("Annuler", role: .cancel) {}
+        } message: {
+            Text("Vous serez retiré de la manche en cours. Vous pourrez revenir avec le code.")
+        }
         .safeAreaInset(edge: .bottom) {
             if priceFieldFocused {
                 keyboardAccessoryBar
@@ -146,6 +171,23 @@ struct OnlineLobbyView: View {
                 linePriceText = formatPriceForField(service.room?.linePrice ?? 2.5)
             }
         }
+        .onChange(of: service.room?.participants.count) { _, count in
+            // Hook QA `-autoStartAt N` : l'hôte lance la partie dès N joueurs.
+            #if DEBUG
+            if let n = QALaunchOptions.autoStartAt, service.role == .host,
+               let c = count, c >= n, !pendingStart, service.room?.status == .lobby {
+                let delay = QALaunchOptions.autoStartDelay
+                if delay > 0 {
+                    Task {
+                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        if !pendingStart, service.room?.status == .lobby { startGame() }
+                    }
+                } else {
+                    startGame()
+                }
+            }
+            #endif
+        }
         .onChange(of: service.room?.linePrice) { _, newValue in
             // Mise à jour push du host → reflète dans le champ si on n'est pas en train de taper
             if !priceFieldFocused, let v = newValue {
@@ -154,6 +196,26 @@ struct OnlineLobbyView: View {
         }
         // Note : pas de .onDisappear ici — le leave est géré au niveau du
         // Group dans `body` pour ne fire qu'au pop réel du nav stack.
+    }
+
+    // MARK: - Toolbar : Quitter (geste explicite, T03b)
+
+    @ToolbarContentBuilder
+    private var leaveToolbarItem: some ToolbarContent {
+        ToolbarItem(placement: .topBarLeading) {
+            Button {
+                if service.room?.status == .playing {
+                    showingLeaveConfirm = true
+                } else {
+                    performLeave()
+                }
+            } label: {
+                Text("Quitter")
+                    .font(.subheadline.weight(.semibold))
+            }
+            .tint(Theme.brandRed)
+            .accessibilityIdentifier("lobby.leave")
+        }
     }
 
     // MARK: - Toolbar : Démarrer (host only, opacité faible quand indispo)
@@ -173,6 +235,7 @@ struct OnlineLobbyView: View {
                     }
                 }
                 .tint(Theme.brandRed)
+                .accessibilityIdentifier("lobby.start")
                 .disabled(!canStart)
                 .opacity(canStart ? 1 : 0.35)
             }
@@ -198,6 +261,7 @@ struct OnlineLobbyView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.5)
                     .padding(.bottom, 2)
+                    .accessibilityIdentifier("lobby.code")
 
                 Button {
                     UIPasteboard.general.string = code
@@ -220,6 +284,7 @@ struct OnlineLobbyView: View {
                     .foregroundStyle(Color(.systemBackground))
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("lobby.copyCode")
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 16)
@@ -335,6 +400,7 @@ struct OnlineLobbyView: View {
                 Text("\(players.count)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("lobby.playerCount")
             }
         }
     }
@@ -518,12 +584,9 @@ struct OnlineLobbyView: View {
         }
     }
 
-    private func performLeaveIfNeeded() {
-        guard !didCallLeave else { return }
-        didCallLeave = true
-        if let uid = auth.userId {
-            Task { await service.leave(myUserId: uid) }
-        }
+    /// Départ explicite — le seul chemin qui appelle `service.leave()`.
+    private func performLeave() {
+        Task { await service.leave() }
     }
 }
 

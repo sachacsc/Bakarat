@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>method</key><string>app-store-connect</string>
+  <key>teamID</key><string>8ATC9B23MK</string>
+  <key>uploadSymbols</key><true/>
+  <!-- MANUEL, comme Zmeo depuis 2026-09-01 : la signature automatique exige
+       le cloud-signing, que la clé API n'a pas (et la session Xcode est morte).
+       Cert Apple Distribution YDN5R9KG7N (seul cert DISTRIBUTION de l'équipe,
+       clé privée dans le trousseau zmeo-dist) + profil créé PAR L'API ASC
+       (scripts/asc-api.py). Le profil Xcode-managed « iOS Team Store
+       Provisioning Profile: com.sacha.Bakarat » (fév. 2026) pointe vers un
+       ancien cert : inutilisable. -->
+  <key>signingStyle</key><string>manual</string>
+  <key>signingCertificate</key><string>Apple Distribution</string>
+  <key>provisioningProfiles</key><dict>
+    <key>com.sacha.Bakarat</key><string>Bakarat AppStore CLI</string>
+  </dict>
+  <key>destination</key><string>export</string>
+</dict></plist>

@@ -69,7 +69,7 @@ enum OnlineDealer {
     }
 
     static func dealCommunity(deck: inout [Card]) -> CommunityDeal? {
-        guard deck.count >= 17 else { return nil }
+        guard deck.count >= 18 else { return nil }  // 1 + 9 + 1 + 3 + 1 + 3 = 18 cartes
         let burn1 = deck.removeFirst()
         let flop: [[Card]] = (0..<3).map { _ in
             [deck.removeFirst(), deck.removeFirst(), deck.removeFirst()]

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Keep-alive quotidien du projet Supabase Bakarat (plan gratuit, pause
+         après 7 jours sans requête). Une requête REST par jour, restauration
+         par l'API si le projet est quand même en pause.
+         Charger : cp scripts/launchd/com.bakarat.keepalive.plist ~/Library/LaunchAgents/
+                   launchctl load ~/Library/LaunchAgents/com.bakarat.keepalive.plist -->
+    <key>Label</key>
+    <string>com.bakarat.keepalive</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>cd "$HOME/Developer/Baccarat" &amp;&amp; exec ./scripts/supabase-keepalive.sh</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict><key>Hour</key><integer>9</integer><key>Minute</key><integer>15</integer></dict>
+    <key>StandardOutPath</key>
+    <string>/Users/sacha/Library/Logs/bakarat-keepalive.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/sacha/Library/Logs/bakarat-keepalive.log</string>
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

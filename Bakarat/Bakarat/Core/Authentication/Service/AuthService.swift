@@ -84,7 +84,20 @@ final class AuthService: ObservableObject {
             self.session = s
             await loadProfile(for: s.user.id)
         } catch {
-            // No cached session — stay signed out
+            // Pas de session en cache. Hook QA (DEBUG) : `-autoLoginEmail` /
+            // `-autoLoginPassword` permettent au tour automatisé de démarrer
+            // déjà connecté.
+            if let email = QALaunchOptions.autoLoginEmail,
+               let password = QALaunchOptions.autoLoginPassword {
+                do {
+                    try await client.auth.signIn(email: email, password: password)
+                    let s = try await client.auth.session
+                    self.session = s
+                    await loadProfile(for: s.user.id)
+                } catch {
+                    self.lastError = friendlyAuthMessage(error)
+                }
+            }
         }
         didFinishInitialRestore = true
     }
