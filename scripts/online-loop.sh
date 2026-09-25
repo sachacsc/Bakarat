@@ -325,11 +325,11 @@ log "terminé → $OUT/SUMMARY.md"
 # ── (g) Le juge : les yeux de l'owner sur les captures (claude -p sur
 # l'abonnement, jamais la clé API) → audits/online/ publié sur main. Un juge
 # qui tombe ne doit pas faire tomber la loop. ────────────────────────────────
-if [ "$NO_JUDGE" -eq 0 ] && command -v claude >/dev/null 2>&1; then
-  log "juge…"
 # Le guest n'a plus rien à faire : on l'éteint pour rendre le Mac au juge et au dev.
 xcrun simctl shutdown "$GUEST_ID" >/dev/null 2>&1 || true
 
+if [ "$NO_JUDGE" -eq 0 ] && command -v claude >/dev/null 2>&1; then
+  log "juge…"
   python3 "$REPO/scripts/online-judge.py" "$OUT" >> "$OUT/judge.log" 2>&1 \
     && log "juge → audits/online/" \
     || log "juge KO (voir $OUT/judge.log)"
