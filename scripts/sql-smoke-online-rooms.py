@@ -59,6 +59,11 @@ PENDING_FLOP = [["5c", "6d", "7h"], ["8c", "9d", "Th"], ["Jd", "Qc", "Ks"]]
 PENDING_TURNS = ["2d", "3c", "4d"]
 PENDING_RIVERS = ["5h", "6s", "7c"]
 
+# Mode Flash : mains de 6 cartes, les 2 dernières (fin du tableau = dernières
+# distribuées) sont publiques pour les autres sièges.
+FLASH_HOST_HAND = ["Ac", "Ad", "Ah", "8s", "9s", "Ts"]
+FLASH_GUEST_HAND = ["Kc", "Kh", "Ks", "2h", "3h", "4h"]
+
 
 # --------------------------------------------------------------------------
 # Transport
@@ -139,7 +144,7 @@ def as_user(uid, sql):
             "%s" % (dollar(claims), sql))
 
 
-def room_state(code, host_uid, participants, game=None, status="lobby"):
+def room_state(code, host_uid, participants, game=None, status="lobby", flash=False):
     """Construit un OnlineRoom encodé comme le ferait JSONEncoder côté Swift."""
     state = {
         "code": code,
@@ -147,7 +152,7 @@ def room_state(code, host_uid, participants, game=None, status="lobby"):
         "participants": participants,
         "status": status,
         "linePrice": 2.5,
-        "flashMode": False,
+        "flashMode": flash,
         "announceTimerSeconds": 0,
         "pastManches": [],
     }
@@ -160,7 +165,7 @@ def participant(uid, name, is_host):
     return {"userId": uid, "displayName": name, "isHost": is_host, "isOnline": True}
 
 
-def game_state(submissions=None, phase="announcing"):
+def game_state(submissions=None, phase="announcing", hands=None):
     """
     gameState minimal mais complet. NOTE : `hands`, `submissions`, `initialScores`
     sont des `[Int: T]` Swift — encodés par JSONEncoder comme des OBJETS à clés
@@ -179,7 +184,7 @@ def game_state(submissions=None, phase="announcing"):
         "phase": phase,
         "currentBoard": 0,
         "rebidRound": 0,
-        "hands": {"0": HOST_HAND, "1": GUEST_HAND},
+        "hands": hands if hands is not None else {"0": HOST_HAND, "1": GUEST_HAND},
         "burns": BURNS,
         "burnsRevealed": 0,
         "communityCards": [[], [], []],
@@ -204,6 +209,12 @@ PARTS_BOTH = [participant(HOST_UID, "QA Host", True),
 def playing_state(submissions=None):
     return room_state(CODE, HOST_UID, PARTS_BOTH,
                       game=game_state(submissions), status="playing")
+
+
+def flash_state():
+    return room_state(CODE, HOST_UID, PARTS_BOTH,
+                      game=game_state(hands={"0": FLASH_HOST_HAND, "1": FLASH_GUEST_HAND}),
+                      status="playing", flash=True)
 
 
 # --------------------------------------------------------------------------
@@ -302,6 +313,34 @@ def build_steps(ctx):
     step("room_get — le guest ne voit ni pendingFlop/Turns/Rivers ni burns",
          lambda c: as_user(GUEST_UID, "select public.room_get('%s') as r;" % CODE),
          check=check_redaction_pending)
+
+    # -- 5 bis. mode Flash : cartes publiques ---------------------------------
+    step("room_publish — l'hôte passe en mode Flash (mains de 6 cartes)",
+         lambda c: as_user(HOST_UID,
+             "select public.room_publish(p_code => '%s', p_expected_version => %d, "
+             "p_state => %s::jsonb, p_status => 'playing') as r;"
+             % (CODE, c["version"], dollar(json.dumps(flash_state())))),
+         check=check_publish_ok, bump=1)
+
+    step("room_get — mode Flash : le guest voit les 2 cartes publiques de l'hôte "
+         "(et seulement elles), sa main entière, rien en pending",
+         lambda c: as_user(GUEST_UID, "select public.room_get('%s') as r;" % CODE),
+         check=check_flash_guest)
+
+    step("room_get — mode Flash : l'hôte voit toujours les mains complètes",
+         lambda c: as_user(HOST_UID, "select public.room_get('%s') as r;" % CODE),
+         check=check_flash_host)
+
+    step("room_publish — l'hôte repasse hors Flash (mains de 2 cartes)",
+         lambda c: as_user(HOST_UID,
+             "select public.room_publish(p_code => '%s', p_expected_version => %d, "
+             "p_state => %s::jsonb, p_status => 'playing') as r;"
+             % (CODE, c["version"], dollar(json.dumps(playing_state())))),
+         check=check_publish_ok, bump=1)
+
+    step("room_get — hors Flash : les autres mains sont de nouveau absentes",
+         lambda c: as_user(GUEST_UID, "select public.room_get('%s') as r;" % CODE),
+         check=check_redaction_guest)
 
     # -- 6. CAS --------------------------------------------------------------
     step("room_publish — mauvaise version => conflict, aucune écriture",
@@ -489,6 +528,30 @@ def check_redaction_pending(payload, ctx):
     need(gs["burns"] == [], "FUITE : le guest voit les cartes brûlées")
     need(gs["burnsRevealed"] == 0, "burnsRevealed doit rester lisible")
     need(gs["communityCards"] == [[], [], []], "communityCards ne doit pas être expurgé")
+
+
+def check_flash_guest(payload, ctx):
+    """Flash : main complète pour soi, 2 dernières cartes des autres, pas de pending."""
+    r = one_row(payload)
+    gs = r["state"]["gameState"]
+    need(r["state"].get("flashMode") is True, "flashMode perdu dans le state lu")
+    hands = gs["hands"]
+    need(hands.get("1") == FLASH_GUEST_HAND,
+         "le guest doit voir sa main entière, reçu %r" % hands.get("1"))
+    need("0" in hands, "Flash : le guest ne voit pas les cartes publiques de l'hôte")
+    need(hands["0"] == FLASH_HOST_HAND[-2:],
+         "Flash : attendu les 2 dernières cartes de l'hôte %r, reçu %r"
+         % (FLASH_HOST_HAND[-2:], hands["0"]))
+    need(len(hands) == 2, "hands devrait contenir exactement 2 entrées : %r" % hands)
+    for k in ("pendingFlop", "pendingTurns", "pendingRivers", "burns"):
+        need(gs[k] == [], "FUITE : le guest voit %s en mode Flash" % k)
+
+
+def check_flash_host(payload, ctx):
+    r = one_row(payload)
+    hands = r["state"]["gameState"]["hands"]
+    need(hands.get("0") == FLASH_HOST_HAND and hands.get("1") == FLASH_GUEST_HAND,
+         "l'hôte doit voir les mains complètes en Flash, reçu %r" % hands)
 
 
 def check_conflict(payload, ctx):
