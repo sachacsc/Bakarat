@@ -253,10 +253,10 @@ struct MidGameSettingsSheet: View {
         return service.room?.participants.first(where: { $0.userId == hostUid })?.displayName
     }
 
+    /// Départ explicite (geste utilisateur) — cf. T03b.
     private func leaveGame() {
         dismiss()
-        guard let uid = auth.userId else { return }
-        Task { await service.leave(myUserId: uid) }
+        Task { await service.leave() }
     }
 
     private func copyCode() {

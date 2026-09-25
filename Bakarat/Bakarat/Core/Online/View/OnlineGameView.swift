@@ -60,6 +60,10 @@ struct OnlineGameView: View {
     /// Flag transient : cadran rouge sur les cartes pendant ~1.5s après un
     /// confirm raté (catégorie sélectionnée mais 0 carte). Auto-clear.
     @State private var promptCardSelection: Bool = false
+    /// Message transitoire « X anime maintenant la partie » (relève d'hôte).
+    @State private var hostChangeMessage: String? = nil
+    /// Jeton d'annulation de la bannière précédente.
+    @State private var hostBannerNonce: Int = 0
 
     var body: some View {
         GeometryReader { geo in
@@ -158,6 +162,47 @@ struct OnlineGameView: View {
                 AllHandsSheet(gs: gs, target: target)
             }
         }
+        // Bannière de relève d'hôte + reconnexion (T22/T20).
+        .overlay(alignment: .top) { statusBanner }
+        .onChange(of: service.hostDisplayName) { oldName, newName in
+            guard oldName != nil, let newName, !newName.isEmpty else { return }
+            hostChangeMessage = "\(newName) anime maintenant la partie"
+            hostBannerNonce += 1
+            let nonce = hostBannerNonce
+            Task {
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if hostBannerNonce == nonce { hostChangeMessage = nil }
+            }
+        }
+    }
+
+    // MARK: - Bannière d'état (reconnexion / relève d'hôte)
+
+    @ViewBuilder
+    private var statusBanner: some View {
+        if let message = bannerMessage {
+            HStack(spacing: 8) {
+                if service.connectionState != .connected {
+                    ProgressView().controlSize(.mini).tint(.white)
+                }
+                Text(message)
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .background(Capsule().fill(Color.black.opacity(0.78)))
+            .padding(.top, 6)
+            .transition(.move(edge: .top).combined(with: .opacity))
+            .animation(.easeInOut(duration: 0.25), value: message)
+        }
+    }
+
+    private var bannerMessage: String? {
+        if service.connectionState == .offline { return "Hors ligne — reconnexion…" }
+        if service.connectionState == .reconnecting || service.isReconnecting { return "Reconnexion…" }
+        return hostChangeMessage
     }
 
     // MARK: - Sizing helpers
@@ -410,12 +455,14 @@ struct OnlineGameView: View {
             let winnerRow = result.perPlayer.first(where: { $0.seat == winnerSeat })
             let displayedCards: [Card] = {
                 if let row = winnerRow, !row.cards.isEmpty { return row.cards }
-                if let hole = gs.hands[winnerSeat] {
+                // Main du gagnant inconnue (état expurgé côté guest — T14) :
+                // on se rabat sur les cartes qu'il a soumises.
+                if let hole = gs.hands[winnerSeat], !hole.isEmpty {
                     return HandEvaluator.autoPickCards(announced: cat,
                                                        hole: hole,
                                                        board: gs.communityCards[boardIdx]) ?? []
                 }
-                return []
+                return winnerRow?.cards ?? []
             }()
             HStack(spacing: 10) {
                 Text(result.isSplit ? "⚡" : "🏆")
@@ -751,12 +798,13 @@ struct OnlineGameView: View {
             let winnerRow = result.perPlayer.first(where: { $0.seat == winnerSeat })
             let displayedCards: [Card] = {
                 if let row = winnerRow, !row.cards.isEmpty { return row.cards }
-                if let hole = gs.hands[winnerSeat] {
+                // Idem tie-break : à défaut de main, les cartes soumises.
+                if let hole = gs.hands[winnerSeat], !hole.isEmpty {
                     return HandEvaluator.autoPickCards(announced: cat,
                                                        hole: hole,
                                                        board: tb.cards) ?? []
                 }
-                return []
+                return winnerRow?.cards ?? []
             }()
             HStack(spacing: 10) {
                 Text("🏆").font(.title3)
@@ -982,7 +1030,7 @@ struct OnlineGameView: View {
         .safeAreaInset(edge: .bottom) {
             if let gs = service.room?.gameState,
                let seat = mySeat(in: gs),
-               gs.hands[seat] != nil,
+               gs.hands[seat]?.isEmpty == false,
                gs.players.first(where: { $0.seat == seat })?.inManche == true {
                 handBubble(gs, seat: seat,
                            availableW: availableW, availableH: availableH)
@@ -1042,7 +1090,7 @@ struct OnlineGameView: View {
             Spacer(minLength: 0)
             if let gs = service.room?.gameState,
                let seat = mySeat(in: gs),
-               gs.hands[seat] != nil,
+               gs.hands[seat]?.isEmpty == false,
                gs.players.first(where: { $0.seat == seat })?.inManche == true {
                 handBubble(gs, seat: seat,
                            availableW: availableW, availableH: availableH)

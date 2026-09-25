@@ -56,7 +56,9 @@ struct BakaratApp: App {
                         await debts.startLiveUpdates(myUserId: uid)
                         // Demande la permission notifs au 1er signed-in
                         // (idempotent : iOS gère le "déjà demandé" lui-même).
-                        await NotificationService.shared.requestAuthorizationAndRegister()
+                        if !QALaunchOptions.isActive {
+                            await NotificationService.shared.requestAuthorizationAndRegister()
+                        }
                     } else {
                         await debts.stopLiveUpdates()
                     }

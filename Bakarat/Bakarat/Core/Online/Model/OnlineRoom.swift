@@ -2,7 +2,8 @@
 //  OnlineRoom.swift
 //  Bakarat
 //
-//  Modèles transportés sur le channel Realtime pour la phase Lobby.
+//  Modèles de la « salle durable » : ce que `online_rooms.state` contient
+//  (encodé/décodé tel quel en jsonb par les RPC `room_*`).
 //
 
 import Foundation
@@ -148,96 +149,6 @@ struct MancheArchive: Codable, Equatable, Identifiable {
         self.fullBoardWinnerSeat = try c.decodeIfPresent(Int.self, forKey: .fullBoardWinnerSeat)
         self.numActive = try c.decodeIfPresent(Int.self, forKey: .numActive) ?? 0
         self.boardMultis = try c.decodeIfPresent([Int: Int].self, forKey: .boardMultis) ?? [:]
-    }
-}
-
-// MARK: - Messages broadcast
-
-/// Enveloppe des messages échangés sur le channel (réutilisée par les phases suivantes).
-struct OnlineMessage: Codable {
-    let kind: Kind
-    let payload: Payload
-
-    enum Kind: String, Codable {
-        /// Guest annonce son arrivée → host répond avec un snapshot
-        case helloFromGuest
-        /// Host pousse le snapshot complet de la room (broadcast régulier)
-        case roomSnapshot
-        /// Quelqu'un quitte volontairement (avant déconnexion forcée)
-        case leave
-        /// Host lance la partie
-        case start
-        /// Guest envoie son annonce pour le board en cours
-        case submitAnnounce
-        /// Guest demande à passer en spectateur (ou à rejoindre) pour la prochaine manche
-        case setSpectator
-    }
-
-    enum Payload: Codable {
-        case hello(userId: UUID, displayName: String)
-        case snapshot(OnlineRoom)
-        case leave(userId: UUID)
-        case start
-        case submitAnnounce(seat: Int, submission: BoardSubmission)
-        case setSpectator(seat: Int, wantsToSpectate: Bool)
-
-        // Custom encoding: tag + value (so it's resilient to future variants)
-        enum CodingKeys: String, CodingKey { case t, v }
-
-        func encode(to encoder: Encoder) throws {
-            var c = encoder.container(keyedBy: CodingKeys.self)
-            switch self {
-            case .hello(let userId, let name):
-                try c.encode("hello", forKey: .t)
-                try c.encode(HelloV(userId: userId, displayName: name), forKey: .v)
-            case .snapshot(let room):
-                try c.encode("snapshot", forKey: .t)
-                try c.encode(room, forKey: .v)
-            case .leave(let userId):
-                try c.encode("leave", forKey: .t)
-                try c.encode(LeaveV(userId: userId), forKey: .v)
-            case .start:
-                try c.encode("start", forKey: .t)
-            case .submitAnnounce(let seat, let submission):
-                try c.encode("submit", forKey: .t)
-                try c.encode(SubmitV(seat: seat, submission: submission), forKey: .v)
-            case .setSpectator(let seat, let wantsToSpectate):
-                try c.encode("spect", forKey: .t)
-                try c.encode(SpectV(seat: seat, wantsToSpectate: wantsToSpectate), forKey: .v)
-            }
-        }
-
-        init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: CodingKeys.self)
-            let tag = try c.decode(String.self, forKey: .t)
-            switch tag {
-            case "hello":
-                let v = try c.decode(HelloV.self, forKey: .v)
-                self = .hello(userId: v.userId, displayName: v.displayName)
-            case "snapshot":
-                let v = try c.decode(OnlineRoom.self, forKey: .v)
-                self = .snapshot(v)
-            case "leave":
-                let v = try c.decode(LeaveV.self, forKey: .v)
-                self = .leave(userId: v.userId)
-            case "start":
-                self = .start
-            case "submit":
-                let v = try c.decode(SubmitV.self, forKey: .v)
-                self = .submitAnnounce(seat: v.seat, submission: v.submission)
-            case "spect":
-                let v = try c.decode(SpectV.self, forKey: .v)
-                self = .setSpectator(seat: v.seat, wantsToSpectate: v.wantsToSpectate)
-            default:
-                throw DecodingError.dataCorruptedError(forKey: .t, in: c,
-                                                       debugDescription: "Unknown tag \(tag)")
-            }
-        }
-
-        private struct HelloV: Codable { let userId: UUID; let displayName: String }
-        private struct LeaveV: Codable { let userId: UUID }
-        private struct SubmitV: Codable { let seat: Int; let submission: BoardSubmission }
-        private struct SpectV: Codable { let seat: Int; let wantsToSpectate: Bool }
     }
 }
 

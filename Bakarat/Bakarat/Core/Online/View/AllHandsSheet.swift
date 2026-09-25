@@ -208,15 +208,19 @@ struct AllHandsSheet: View {
                let catId = row.announcedCategoryId,
                let cat = HandCategory.from(id: catId),
                !row.isSkip, !row.isForfeit, !row.isExcluded,
-               let hole = gs.hands[row.seat] {
+               let hole = gs.hands[row.seat], !hole.isEmpty {
                 displayCards = HandEvaluator.autoPickCards(announced: cat, hole: hole, board: boardCards) ?? []
             }
 
-            // Force de la main : on évalue avec la main complète si possible
+            // Force de la main : avec la main complète si on la connaît, sinon
+            // avec les cartes soumises (l'état est expurgé côté guest — T14).
             let value: HandValue? = {
                 guard !row.isSkip, !row.isForfeit, !row.isExcluded else { return nil }
-                guard let hole = gs.hands[row.seat] else { return nil }
-                return HandEvaluator.evaluateBest(hole + boardCards)
+                if let hole = gs.hands[row.seat], !hole.isEmpty {
+                    return HandEvaluator.evaluateBest(hole + boardCards)
+                }
+                guard !displayCards.isEmpty else { return nil }
+                return HandEvaluator.evaluateBest(displayCards + boardCards)
             }()
 
             let (label, color): (String, Color) = {
