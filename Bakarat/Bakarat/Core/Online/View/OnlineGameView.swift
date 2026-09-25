@@ -78,6 +78,9 @@ struct OnlineGameView: View {
                 }
             }
         }
+        // `.contain` : l'identifiant reste sur le conteneur et n'écrase PAS ceux
+        // des enfants (cartes, panneau d'annonce) — vu au tour du 25/09.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("game.root")
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(true) // pas de retour accidentel en partie
