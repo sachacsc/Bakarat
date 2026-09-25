@@ -351,17 +351,29 @@ final class BakaratTourUITests: XCTestCase {
         // Un board à égalité rouvre un panneau d'annonce (tie-break) : l'hôte
         // étant le seul humain, il doit y répondre — sinon la manche ne se
         // termine jamais et le récap n'arrive pas.
+        // Détection par le LIBELLÉ DE PHASE (OnlineGameView.phaseLabel /
+        // navLabelForActiveBoard) : « Split · Ns » / « Split 2 · Ns » avec
+        // chrono, « Tie-break — annonces » sans. Plafond : 3 rounds.
         var ended = false
         var tiebreak = 0
+        let maxTiebreaks = 3
         let mancheDeadline = Date().addingTimeInterval(Wait.mancheEnd)
         while Date() < mancheDeadline {
             if element("game.mancheEnd").exists { ended = true; break }
-            if !element("announce.submitted").exists, confirmButton.exists {
+            let label = phaseLabel
+            let inTiebreakAnnounce = label.hasPrefix("Split")
+                || label.localizedCaseInsensitiveContains("Tie-break — annonces")
+            if inTiebreakAnnounce, tiebreak < maxTiebreaks,
+               !element("announce.submitted").exists, confirmButton.exists {
                 tiebreak += 1
-                XCTContext.runActivity(named: "tie-break \(tiebreak) — l'hôte réannonce") { _ in }
+                XCTContext.runActivity(named: "tie-break \(tiebreak) (« \(label) ») — l'hôte réannonce") { _ in }
                 shot("10-tiebreak-\(tiebreak)")
-                tapIfExists("game.hand.card0", timeout: 5)
                 tap(confirmButton, timeout: 5)
+                // Laisser la soumission partir avant de réévaluer la phase.
+                _ = waitFor(10) {
+                    self.element("announce.submitted").exists || !self.confirmButton.exists
+                        || self.element("game.mancheEnd").exists
+                }
             }
             settle(0.5)
         }
@@ -446,7 +458,15 @@ final class BakaratTourUITests: XCTestCase {
         if tapIfExists("game.settings", timeout: 10) {
             settle(1)
             shot("15-reglages")
-            if tapIfExists("settings.leave", timeout: 8) {
+            // `settings.leave`, sinon un bouton « Quitter… » du SHEET (puis
+            // partout) — jamais celui du lobby : on n'est pas au lobby ici.
+            var leave = element("settings.leave")
+            if !leave.waitForExistence(timeout: 8) {
+                let quitter = NSPredicate(format: "label CONTAINS %@", "Quitter")
+                let inSheet = app.sheets.buttons.matching(quitter).firstMatch
+                leave = inSheet.exists ? inSheet : app.buttons.matching(quitter).firstMatch
+            }
+            if tap(leave, timeout: 3) {
                 // Confirmation éventuelle (« Quitter la partie ? ») : elle vit
                 // dans une alerte / un confirmationDialog. On la cherche LÀ,
                 // jamais dans la page — sinon on retaperait « Quitter la
@@ -480,10 +500,11 @@ final class BakaratTourUITests: XCTestCase {
 
     // MARK: - Une annonce
 
-    /// Annonce sur le board courant. L'app EXIGE au moins une carte
-    /// sélectionnée (même pour Hauteur : 0 carte = shake, pas de soumission) —
-    /// on tape donc une carte de la main, puis on confirme sur la catégorie
-    /// par défaut (« Hauteur », auto-pick : aucune pilule à choisir).
+    /// Annonce sur le board courant, sur la catégorie par défaut « Hauteur ».
+    /// RULES.md : Hauteur = auto-pick, aucune sélection requise — l'app
+    /// choisit les 2 meilleures cartes. Le tap sur une carte de la main reste
+    /// un best-effort (souvent non « hittable » sous XCUITest) : son échec
+    /// n'est PAS un défaut. Ce qui compte : l'annonce part après « Confirmer ».
     private func announceOnCurrentBoard(step: Int, board: Int) {
         // Le panneau doit être PRÊT À ANNONCER : présent, et pas encore dans
         // son état « envoyée » (qui peut être un résidu du board précédent).
@@ -504,10 +525,12 @@ final class BakaratTourUITests: XCTestCase {
         settle(0.8)
         shot("\(pad(step))-annonce-b\(board)")
 
-        // 1 carte de la main suffit — le kicker est complété par l'app.
-        if !tapIfExists("game.hand.card0", timeout: 8) {
-            diag("\(pad(step))-DIAG-main-intappable-b\(board)")
-            XCTFail("les cartes de la main doivent être sélectionnables pendant l'annonce")
+        // Best-effort : sélectionner une carte n'est pas nécessaire pour
+        // Hauteur (auto-pick) — pas de DIAG si le tap échoue.
+        let card0 = element("game.hand.card0")
+        if card0.waitForExistence(timeout: 3), card0.isHittable {
+            card0.tap()
+            settle(0.4)
         }
         // Catégorie : on reste sur le défaut « Hauteur » (auto-pick). Choisir
         // une pilule exigerait une main compatible — le tour ne parie pas.
@@ -520,14 +543,19 @@ final class BakaratTourUITests: XCTestCase {
             return
         }
 
+        // La soumission est partie si : état « envoyée », ou le bouton
+        // « Confirmer » / le panneau a disparu, ou la manche est finie.
+        // (La puce ⏳/✓ de l'hôte n'a pas d'identifiant — non utilisée.)
         let accepted = waitFor(Wait.reveal) {
             self.element("announce.submitted").exists
                 || self.element("game.mancheEnd").exists
                 || !self.element("announce.panel").exists
+                || !self.confirmButton.exists
         }
         if !accepted {
-            diag("\(pad(step))-DIAG-annonce-non-prise-b\(board)")
-            XCTFail("après « Confirmer », l'annonce doit être enregistrée")
+            diag("\(pad(step))-DIAG-annonce-non-envoyee-b\(board)")
+            XCTFail("annonce non envoyée — après « Confirmer : Hauteur », l'annonce "
+                    + "doit partir sans sélection (auto-pick, RULES.md)")
         }
         shot("\(pad(step))-annonce-b\(board)-envoyee")
 

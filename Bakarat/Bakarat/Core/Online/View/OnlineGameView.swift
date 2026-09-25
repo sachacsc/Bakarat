@@ -668,8 +668,22 @@ struct OnlineGameView: View {
                     selectedCards: selectedCards,
                     onConfirm: {
                         let cat = lockedCat ?? selectedCategory ?? .highcard
-                        // Toute catégorie — y compris Hauteur — exige au moins
-                        // 1 carte sélectionnée pour éviter les taps accidentels.
+                        // RULES.md § « Auto-pick vs sélection manuelle » :
+                        // « Hauteur : auto-pick par défaut — l'app choisit les
+                        // 2 meilleures cartes du joueur. Pas besoin de
+                        // sélectionner. » → Hauteur sans sélection (y compris
+                        // tie-break verrouillé sur Hauteur) = auto-pick.
+                        if cat == .highcard && selectedCards.isEmpty,
+                           let auto = HandEvaluator.autoPickCards(
+                               announced: .highcard,
+                               hole: gs.hands[seat] ?? [],
+                               board: boardCardsForAnnounce) {
+                            let submission = BoardSubmission(categoryId: cat.id, cards: auto)
+                            Task { await service.submitAnnounce(submission: submission, mySeat: seat) }
+                            return
+                        }
+                        // Les autres catégories exigent au moins 1 carte
+                        // sélectionnée pour éviter les taps accidentels.
                         // 0 carte → shake les cartes + cadran rouge transient.
                         if selectedCards.isEmpty {
                             withAnimation(.linear(duration: 0.4)) {
