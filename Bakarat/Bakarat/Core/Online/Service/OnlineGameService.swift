@@ -87,6 +87,13 @@ final class OnlineGameService: ObservableObject {
     private var isResolvingBoard = false
     /// Manches déjà persistées (idempotence de `record_manche`).
     private var recordedManches: Set<Int> = []
+    /// B-0004/B-0005 : userIds déjà poussés dans `game_participants` par
+    /// `ensure_game_and_participants` (dernier appel réussi).
+    private var cloudSyncedParticipantIds: Set<UUID> = []
+    /// Un seul `ensureGameInCloud` à la fois.
+    private var isEnsuringGame = false
+    /// Horodatage du dernier `ensureGameInCloud` déclenché par un changement de participants.
+    private var lastParticipantsSyncAt: Date = .distantPast
 
     /// Intervalle de heartbeat du `touch_game_active` (historique « En cours »).
     private static let touchInterval: TimeInterval = 30
@@ -370,6 +377,7 @@ final class OnlineGameService: ObservableObject {
     /// (hôte), relève du bail (guest).
     private func reactToSnapshot() async {
         if role == .host {
+            await syncCloudParticipantsIfNeeded()
             await syncPresenceFlags()
             await checkAllSubmitted()
         } else {
@@ -385,6 +393,9 @@ final class OnlineGameService: ObservableObject {
         serverTimeOffset = hb.serverNow.timeIntervalSinceNow
         applyRoleFromServer(hostUserId: hb.hostUserId)
         if role == .host {
+            // Rattrapage du throttle : le heartbeat (2 s lobby / 5 s partie) relance
+            // la synchro si un snapshot l'avait différée.
+            await syncCloudParticipantsIfNeeded()
             await syncPresenceFlags()
         } else {
             await evaluateHostLease()
@@ -591,6 +602,9 @@ final class OnlineGameService: ObservableObject {
         }
         if ok {
             phase = .playing
+            // Garantit que tous les joueurs (bots compris) sont dans `game_participants`
+            // avant la fin de la manche 1 (sinon « 1 joueur » dans Recent sessions).
+            await syncCloudParticipantsIfNeeded(force: true)
             startHostDriver()
         }
     }
@@ -1475,9 +1489,30 @@ final class OnlineGameService: ObservableObject {
 
     // MARK: - Cycle de vie cloud (ensure + touch)
 
+    /// Host (B-0004/B-0005) : l'ancien protocole appelait `ensureGameInCloud` à
+    /// chaque `hello` ; dans la salle durable, les arrivées passent par les
+    /// snapshots. Si l'ensemble des userIds de `room.participants` diffère du
+    /// dernier poussé, on relance `ensure_game_and_participants`.
+    /// Throttle 2 s (sauf `force`), jamais deux appels en parallèle ; un appel
+    /// différé est rattrapé par le snapshot ou le heartbeat suivant.
+    private func syncCloudParticipantsIfNeeded(force: Bool = false) async {
+        guard role == .host, let current = room else { return }
+        let ids = Set(current.participants.map(\.userId))
+        guard ids != cloudSyncedParticipantIds else { return }
+        guard !isEnsuringGame else { return }
+        guard force || Date().timeIntervalSince(lastParticipantsSyncAt) >= 2 else { return }
+        lastParticipantsSyncAt = Date()
+        log("participants changés (\(ids.count)) → ensure_game_and_participants")
+        await ensureGameInCloud()
+    }
+
     /// Host : crée la `games` Supabase (ou synchronise ses participants).
     private func ensureGameInCloud() async {
         guard role == .host, let current = room else { return }
+        guard !isEnsuringGame else { return }
+        isEnsuringGame = true
+        defer { isEnsuringGame = false }
+        let sentIds = Set(current.participants.map(\.userId))
 
         let participantsPayload = current.participants.enumerated().map { idx, p in
             EnsureGameParticipant(seat_index: idx, user_id: p.userId.uuidString, guest_name: nil)
@@ -1494,6 +1529,7 @@ final class OnlineGameService: ObservableObject {
         do {
             let response = try await client.rpc("ensure_game_and_participants", params: params).execute()
             let returnedGameId = try JSONDecoder().decode(UUID.self, from: response.data)
+            cloudSyncedParticipantIds = sentIds
             if current.cloudGameId == nil {
                 await mutate { room in
                     guard room.cloudGameId == nil else { return }

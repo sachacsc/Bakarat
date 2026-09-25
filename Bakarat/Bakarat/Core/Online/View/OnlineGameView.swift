@@ -1057,6 +1057,7 @@ struct OnlineGameView: View {
                 currentBoard: service.room?.gameState?.currentBoard,
                 mancheNumber: service.room?.gameState?.mancheNumber,
                 tiebreakRound: service.room?.gameState?.tiebreakBoards.last.map { "tb-\($0.parentBoardIdx)-\($0.round)" },
+                isMancheEnd: service.room?.gameState?.phase == .mancheEnd,
                 anchor: .top,
                 proxy: proxy
             ))
@@ -1065,7 +1066,11 @@ struct OnlineGameView: View {
             if let gs = service.room?.gameState,
                let seat = mySeat(in: gs),
                gs.hands[seat]?.isEmpty == false,
-               gs.players.first(where: { $0.seat == seat })?.inManche == true {
+               gs.players.first(where: { $0.seat == seat })?.inManche == true,
+               // B-0001 : en fin de manche la main ne sert plus (le récap montre
+               // les cartes annoncées, « Autres mains » reste sur chaque board) ;
+               // on retire le tiroir pour que récap + « Manche suivante » restent visibles.
+               gs.phase != .mancheEnd {
                 handBubble(gs, seat: seat,
                            availableW: availableW, availableH: availableH)
                     .padding(.horizontal, handBubbleInnerPadding)
@@ -1099,6 +1104,7 @@ struct OnlineGameView: View {
                     currentBoard: service.room?.gameState?.currentBoard,
                     mancheNumber: service.room?.gameState?.mancheNumber,
                     tiebreakRound: service.room?.gameState?.tiebreakBoards.last.map { "tb-\($0.parentBoardIdx)-\($0.round)" },
+                    isMancheEnd: service.room?.gameState?.phase == .mancheEnd,
                     anchor: .center,
                     proxy: proxy
                 ))
@@ -1125,7 +1131,11 @@ struct OnlineGameView: View {
             if let gs = service.room?.gameState,
                let seat = mySeat(in: gs),
                gs.hands[seat]?.isEmpty == false,
-               gs.players.first(where: { $0.seat == seat })?.inManche == true {
+               gs.players.first(where: { $0.seat == seat })?.inManche == true,
+               // B-0001 : en fin de manche la main ne sert plus (le récap montre
+               // les cartes annoncées, « Autres mains » reste sur chaque board) ;
+               // on retire le tiroir pour que récap + « Manche suivante » restent visibles.
+               gs.phase != .mancheEnd {
                 handBubble(gs, seat: seat,
                            availableW: availableW, availableH: availableH)
                     .padding(.horizontal, handBubbleInnerPadding)
@@ -1216,6 +1226,7 @@ struct OnlineGameView: View {
             }
             if gs.phase == .mancheEnd {
                 mancheEndPanel(gs)
+                    .id(BoardAutoScrollModifier.mancheEndID)
             }
         } else {
             ProgressView().padding(.top, 60)
@@ -1506,11 +1517,24 @@ private struct BoardAutoScrollModifier: ViewModifier {
     let currentBoard: Int?
     let mancheNumber: Int?
     let tiebreakRound: String?
+    /// B-0001 : vrai en phase `mancheEnd` → on descend jusqu'au récap.
+    let isMancheEnd: Bool
     let anchor: UnitPoint
     let proxy: ScrollViewProxy
 
+    /// Identifiant de scroll du panneau de fin de manche.
+    static let mancheEndID = "manche-end"
+
     func body(content: Content) -> some View {
         content
+            .onAppear {
+                // Vue (re)montée directement en fin de manche (retour d'arrière-plan, reprise).
+                if isMancheEnd { scrollTo(Self.mancheEndID, anchor: .bottom) }
+            }
+            .onChange(of: isMancheEnd) { _, new in
+                // Entrée en fin de manche : le récap + « Manche suivante » en bas d'écran.
+                if new { scrollTo(Self.mancheEndID, anchor: .bottom) }
+            }
             .onChange(of: mancheNumber) { _, _ in
                 scrollTo("board-0")
             }
@@ -1524,11 +1548,11 @@ private struct BoardAutoScrollModifier: ViewModifier {
             }
     }
 
-    private func scrollTo(_ id: String) {
+    private func scrollTo(_ id: String, anchor overrideAnchor: UnitPoint? = nil) {
         Task { @MainActor in
             try? await Task.sleep(nanoseconds: 80_000_000)  // 80ms : laisse le layout se faire
             withAnimation(.easeInOut(duration: 0.45)) {
-                proxy.scrollTo(id, anchor: anchor)
+                proxy.scrollTo(id, anchor: overrideAnchor ?? anchor)
             }
         }
     }

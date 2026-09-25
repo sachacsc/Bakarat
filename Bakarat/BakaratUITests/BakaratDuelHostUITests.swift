@@ -45,7 +45,7 @@ final class BakaratDuelHostUITests: DuelUITestCase {
             return (counter.exists && (Int(counter.label) ?? 0) >= 2) || self.isInGame
         }
         if !joined {
-            shot("02-DIAG-guest-jamais-arrive")
+            diag("02-DIAG-guest-jamais-arrive")
             XCTFail("le guest doit rejoindre \(duelCode) en moins de 90 s")
         }
         shot("02-guest-arrive")
@@ -59,14 +59,14 @@ final class BakaratDuelHostUITests: DuelUITestCase {
         // ── 04 · Scénario 1 : une manche complète ────────────────────────
         let dealt = waitFor(60) { (1...3).allSatisfy { self.boardCardCount($0) == 5 } }
         if !dealt {
-            shot("04-DIAG-boards-incomplets")
+            diag("04-DIAG-boards-incomplets")
             XCTFail("les 15 cartes communautaires doivent arriver en moins de 60 s")
         }
         shot("04-boards-complets")
 
         let manche1 = playUntilMancheEnd(number: 1, timeout: 240)
         if !manche1 {
-            shot("05-DIAG-manche-1-inachevee")
+            diag("05-DIAG-manche-1-inachevee")
             XCTFail("la manche 1 du duel doit aller jusqu'à son récapitulatif")
         }
         settle(1)
@@ -75,22 +75,15 @@ final class BakaratDuelHostUITests: DuelUITestCase {
         // ── 06 · Scénario 2 : le guest s'absente pendant la manche 2 ─────
         // Côté hôte, il n'y a rien à faire de spécial : on enchaîne, et on
         // vérifie qu'on ne se fige pas en attendant une annonce qui tarde.
-        if !tapIfExists("game.nextManche", timeout: 20) {
-            shot("06-DIAG-manche-suivante-introuvable")
-            XCTFail("l'hôte doit pouvoir lancer la manche suivante")
-        }
-        let manche2Started = waitFor(90) {
-            self.endedMancheNumber() == nil && self.exists("game.hand.card0")
-        }
-        if !manche2Started {
-            shot("06-DIAG-manche-2-non-distribuee")
-            XCTFail("la manche 2 doit être distribuée")
-        }
+        // « Manche suivante » est SOUS le pli et sous la bulle de main : on
+        // fait défiler jusqu'à ce qu'il soit touchable (recette du tour).
+        startNextManche(after: 1, step: "06")
+        settle(1)
         shot("06-manche-2-distribuee")
 
         let manche2 = playUntilMancheEnd(number: 2, timeout: 300)
         if !manche2 {
-            shot("07-DIAG-manche-2-inachevee")
+            diag("07-DIAG-manche-2-inachevee")
             XCTFail("l'absence de 20 s du guest ne doit pas bloquer la manche 2")
         }
         settle(1)
@@ -98,16 +91,15 @@ final class BakaratDuelHostUITests: DuelUITestCase {
         XCTAssertTrue(isInGame, "l'hôte est toujours dans la partie après l'absence du guest")
 
         // ── 08 · Scénario 3 : c'est l'HÔTE qui s'absente 30 s ────────────
-        if !tapIfExists("game.nextManche", timeout: 20) {
-            shot("08-DIAG-manche-3-impossible")
-            XCTFail("l'hôte doit pouvoir lancer la manche 3")
+        if !startNextManche(after: 2, step: "08") {
             dumpVisibleTexts("fin")
             return
         }
         // On attend une phase « vivante » (annonces ou reveal) avant de partir :
-        // c'est là que la coupure fait le plus mal.
+        // c'est là que la coupure fait le plus mal. Avec chrono, le libellé
+        // d'annonce est « BN · 27s » (pas « Annonces ») → `isAnnouncingAny`.
         _ = waitFor(90) {
-            self.phaseLabel.contains("Annonces") || self.phaseLabel.contains("Reveal")
+            self.isAnnouncingAny || self.phaseLabel.contains("Reveal")
         }
         shot("08-avant-absence-hote")
         let phaseBefore = phaseLabel
@@ -117,7 +109,7 @@ final class BakaratDuelHostUITests: DuelUITestCase {
 
         let alive = element("game.root").waitForExistence(timeout: 30) || isInGame
         if !alive {
-            shot("09-DIAG-partie-perdue-cote-hote")
+            diag("09-DIAG-partie-perdue-cote-hote")
             XCTFail("après 30 s en arrière-plan, l'hôte doit retrouver SA partie")
         }
         XCTAssertFalse(exists("play.createOnline"),
@@ -130,6 +122,8 @@ final class BakaratDuelHostUITests: DuelUITestCase {
         announceIfPossible()
         settle(5)
         shot("10-duel-fin")
+        XCTAssertLessThanOrEqual(snapshotTimeouts, maxSnapshotTimeouts,
+                                 "trop de requêtes UI expirées : l'app de l'hôte s'est figée")
         dumpVisibleTexts("fin")
     }
 }

@@ -29,7 +29,7 @@ final class BakaratDuelGuestUITests: DuelUITestCase {
         // ── 01 · Le salon est rejoint tout seul ──────────────────────────
         let arrived = waitFor(90) { self.exists("lobby.code") || self.isInGame }
         if !arrived {
-            shot("01-DIAG-salon-introuvable")
+            diag("01-DIAG-salon-introuvable")
             XCTFail("l'invité doit rejoindre \(duelCode) en moins de 90 s (-autoJoinCode)")
         }
         settle(1)
@@ -50,24 +50,29 @@ final class BakaratDuelGuestUITests: DuelUITestCase {
         // ── 04 · Scénario 1 : une manche complète ────────────────────────
         let manche1 = playUntilMancheEnd(number: 1, timeout: 240)
         if !manche1 {
-            shot("04-DIAG-manche-1-inachevee")
+            diag("04-DIAG-manche-1-inachevee")
             XCTFail("la manche 1 du duel doit aller jusqu'à son récapitulatif")
         }
         settle(1)
         shot("04-manche-1-terminee")
 
         // ── 05 · Scénario 2 : l'invité s'absente 20 s en pleine annonce ──
-        // (c'est l'hôte qui lance la manche 2 ; l'invité l'attend.)
-        let manche2Dealt = waitFor(120) {
-            self.endedMancheNumber() == nil && self.exists("game.hand.card0")
-        }
+        // (c'est l'hôte qui lance la manche 2 ; l'invité l'attend. L'hôte doit
+        // d'abord faire défiler jusqu'à « Manche suivante », taper, parfois
+        // retaper : 90 s au minimum, 150 s ici pour absorber la charge.)
+        let manche2Dealt = waitFor(150) { self.nextMancheStarted(after: 1) }
         if !manche2Dealt {
-            shot("05-DIAG-manche-2-jamais-vue")
+            diag("05-DIAG-manche-2-jamais-vue")
             XCTFail("l'invité doit voir la manche 2 arriver")
         }
-        let announcing = waitFor(120) { self.exists("announce.panel") && !self.exists("announce.submitted") }
+        shot("05-manche-2-distribuee")
+        // Annonces en cours (libellé « BN · Ns » / « Annonces » + valeur BN),
+        // pas encore envoyée, bouton « Confirmer » exposé.
+        let announcing = waitFor(120) {
+            self.isAnnouncingAny && !self.exists("announce.submitted") && self.confirmButton.exists
+        }
         if !announcing {
-            shot("05-DIAG-pas-d-annonce-a-faire")
+            diag("05-DIAG-pas-d-annonce-a-faire")
         }
         shot("05-avant-absence")
 
@@ -76,7 +81,7 @@ final class BakaratDuelGuestUITests: DuelUITestCase {
 
         let stillThere = element("game.root").waitForExistence(timeout: 30) || isInGame
         if !stillThere {
-            shot("06-DIAG-partie-perdue-cote-invite")
+            diag("06-DIAG-partie-perdue-cote-invite")
             XCTFail("après 20 s en arrière-plan, l'invité doit retrouver la partie")
         }
         XCTAssertFalse(exists("play.createOnline"),
@@ -88,14 +93,14 @@ final class BakaratDuelGuestUITests: DuelUITestCase {
             return self.announceIfPossible()
         }
         if !sent {
-            shot("07-DIAG-annonce-impossible-apres-retour")
+            diag("07-DIAG-annonce-impossible-apres-retour")
             XCTFail("après une absence de 20 s, l'invité doit pouvoir annoncer")
         }
         shot("07-annonce-apres-retour")
 
         let manche2 = playUntilMancheEnd(number: 2, timeout: 300)
         if !manche2 {
-            shot("08-DIAG-manche-2-inachevee")
+            diag("08-DIAG-manche-2-inachevee")
             XCTFail("la manche 2 doit se terminer malgré l'absence de l'invité")
         }
         shot("08-manche-2-terminee")
@@ -104,11 +109,9 @@ final class BakaratDuelGuestUITests: DuelUITestCase {
         // L'invité ne fait RIEN de spécial : il regarde. La partie doit
         // avancer (bail repris → « X anime maintenant la partie »), sans
         // jamais se figer sur un écran mort.
-        let manche3Dealt = waitFor(150) {
-            self.endedMancheNumber() == nil && self.exists("game.hand.card0")
-        }
+        let manche3Dealt = waitFor(150) { self.nextMancheStarted(after: 2) }
         if !manche3Dealt {
-            shot("09-DIAG-manche-3-jamais-vue")
+            diag("09-DIAG-manche-3-jamais-vue")
         }
         shot("09-manche-3")
 
@@ -121,7 +124,7 @@ final class BakaratDuelGuestUITests: DuelUITestCase {
         }
         if sawBanner { shot("10-banniere-releve") }
         if !moved {
-            shot("10-DIAG-partie-figee-hote-absent")
+            diag("10-DIAG-partie-figee-hote-absent")
             XCTFail("l'absence de 30 s de l'hôte ne doit pas figer l'invité : "
                     + "soit la bannière « anime maintenant », soit la phase avance "
                     + "(lu : « \(phaseLabel) »)")
@@ -132,6 +135,8 @@ final class BakaratDuelGuestUITests: DuelUITestCase {
         settle(5)
         shot("11-duel-fin")
         XCTAssertTrue(isInGame, "à la fin du duel, l'invité est toujours dans la partie")
+        XCTAssertLessThanOrEqual(snapshotTimeouts, maxSnapshotTimeouts,
+                                 "trop de requêtes UI expirées : l'app de l'invité s'est figée")
         dumpVisibleTexts("fin")
     }
 }
