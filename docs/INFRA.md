@@ -40,6 +40,17 @@ Mot de passe commun et URL/anon : `~/.bakarat-qa.env` (0600, variables `BAKARAT_
 * DerivedData dédiée : `~/Library/Caches/bakarat-dd` (jamais `/tmp` : macOS purge).
 * SDK `supabase-swift` **2.55.2** (bumpé le 2026-09-25 ; 2.46.0 avait le bug #999).
 
+## TestFlight
+
+* `scripts/release-testflight.sh [--check|--no-upload|--yes]` : archive (`~/Library/Caches/bakarat-archive`) → export → `altool --validate-app` → `--upload-app` ; ipa sur `~/Desktop`.
+* Toolchain FINALE seulement (`/Applications/Xcode.app`, 27A266a) ; refuse `Xcode-beta.app` et toute build `NNxNNNNy` (27A5194q).
+* Identifiants partagés avec Zmeo : `~/.zmeo-appstore.env` (0600 ; `ASC_USER`/`ASC_APP_PASSWORD` via `@env:`, `ASC_KEY_ID`/`ASC_ISSUER_ID` pour signer sans session Xcode) ; surcharge `ASC_ENV_FILE`.
+* Export en signature MANUELLE (`scripts/ExportOptions-appstore.plist`) : cert Apple Distribution `YDN5R9KG7N` (trousseau `zmeo-dist`) + profil « Bakarat AppStore CLI ».
+* Profils/identifiants via l'API ASC : `scripts/asc-api.py` (app ASC `6770568592`, bundle id `M5GBU33Q8F`).
+* Avant chaque envoi : bump `CURRENT_PROJECT_VERSION` sur TOUTES les cibles (Apple refuse un doublon, `--validate-app` ne le voit pas).
+* Trousseau verrouillé (`errSecInternalComponent`) → `security unlock-keychain ~/Library/Keychains/zmeo-dist.keychain-db` (mdp `~/.zmeo-dist-cert/kc-pass`).
+* Historique : builds 1-9 en mai 2026 (profil Xcode-managed, ancien cert, inutilisable) ; 1.0 (10) = première build du pipeline CLI (T41).
+
 ## Automatisations (launchd, Mac de l'owner)
 
 | Label | Heure (Paris) | Rôle |
