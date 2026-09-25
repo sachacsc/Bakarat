@@ -71,6 +71,27 @@ log "bakarat-guest = $GUEST_ID"
 xcrun simctl bootstatus "$HOST_ID" -b >/dev/null 2>&1 || true
 xcrun simctl bootstatus "$GUEST_ID" -b >/dev/null 2>&1 || true
 
+# ── Journal QA de l'app (Documents/qa.log) ───────────────────────────────────
+# Un XCUITest ne peut pas lire le container de l'app : c'est le runner qui va
+# le chercher. `QALog` (Core/QA/QALaunchOptions.swift) n'écrit que si un hook
+# QA est actif — donc uniquement pendant le tour et le duel. Bonus : ce fichier
+# atterrit dans $OUT/*.log, que les heuristiques de summary.json parcourent
+# déjà (resync / room_claim_host / conflict y apparaissent tels quels).
+export_qa_log() {
+  local sim="$1" dest="$2"
+  local container
+  container=$(xcrun simctl get_app_container "$sim" com.sacha.Bakarat data 2>/dev/null || true)
+  if [ -z "$container" ] || [ ! -f "$container/Documents/qa.log" ]; then
+    log "qa.log introuvable pour $sim (app jamais lancée avec un hook QA ?)"
+    return 0
+  fi
+  cp "$container/Documents/qa.log" "$dest"
+  log "qa.log → $(basename "$dest") ($(wc -l < "$dest" | tr -d ' ') lignes)"
+  # On repart d'un journal vide : la passe suivante ne doit pas relire celle
+  # d'avant (sinon les compteurs de summary.json doublent).
+  : > "$container/Documents/qa.log"
+}
+
 # ── Auto-guérison SPM (leçon Zmeo — un kill pendant un download laisse un
 # artefact corrompu et TOUTES les passes échouent en silence) ────────────────
 heal_spm_if_needed() {
@@ -165,6 +186,7 @@ if want tour; then
     TEST_RUNNER_TOUR_MODE="$mode" \
     TEST_RUNNER_BAKARAT_QA_PASSWORD="${BAKARAT_QA_PASSWORD:-}" \
       run_suite "$HOST_ID" "tour-$mode" -only-testing:BakaratUITests/BakaratTourUITests
+    export_qa_log "$HOST_ID" "$OUT/qa-tour-$mode.log"
   done
 fi
 
@@ -178,12 +200,14 @@ if want duel; then
   (
     TEST_RUNNER_BAKARAT_QA_PASSWORD="${BAKARAT_QA_PASSWORD:-}" \
       run_suite "$HOST_ID" "duel-host" -only-testing:BakaratUITests/BakaratDuelHostUITests
+    export_qa_log "$HOST_ID" "$OUT/qa-duel-host.log"
   ) &
   HOST_PID=$!
   (
     sleep 8
     TEST_RUNNER_BAKARAT_QA_PASSWORD="${BAKARAT_QA_PASSWORD:-}" \
       run_suite "$GUEST_ID" "duel-guest" -only-testing:BakaratUITests/BakaratDuelGuestUITests
+    export_qa_log "$GUEST_ID" "$OUT/qa-duel-guest.log"
   ) &
   GUEST_PID=$!
   wait "$HOST_PID" "$GUEST_PID"

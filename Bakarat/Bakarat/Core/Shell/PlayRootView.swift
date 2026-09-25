@@ -186,6 +186,7 @@ struct PlayRootView: View {
                 )
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("play.createOnline")
             .disabled(isCreatingGame)
             .listRowBackground(Theme.brandGradient)
             .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
@@ -203,6 +204,7 @@ struct PlayRootView: View {
                 )
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("play.joinOnline")
             .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
         } header: {
             Text("Online")

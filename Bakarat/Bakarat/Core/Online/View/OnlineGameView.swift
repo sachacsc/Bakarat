@@ -78,6 +78,7 @@ struct OnlineGameView: View {
                 }
             }
         }
+        .accessibilityIdentifier("game.root")
         .navigationBarTitleDisplayMode(.inline)
         .navigationBarBackButtonHidden(true) // pas de retour accidentel en partie
         .toolbar(.hidden, for: .tabBar)      // masque la tabbar pendant la partie
@@ -92,6 +93,7 @@ struct OnlineGameView: View {
                     Image(systemName: "slider.horizontal.3")
                 }
                 .tint(Theme.brandRed)
+                .accessibilityIdentifier("game.settings")
             }
             // Spectator count : visible UNIQUEMENT s'il y a au moins 1 spectateur
             // ou joueur en attente pour la prochaine manche. Chiffre AVANT l'œil.
@@ -120,6 +122,7 @@ struct OnlineGameView: View {
                     Image(systemName: "eurosign.circle")
                 }
                 .tint(Theme.brandRed)
+                .accessibilityIdentifier("game.balance")
             }
         }
         .sheet(isPresented: $showingBalanceSheet) {
@@ -193,6 +196,7 @@ struct OnlineGameView: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
             .background(Capsule().fill(Color.black.opacity(0.78)))
+            .accessibilityIdentifier("game.banner")
             .padding(.top, 6)
             .transition(.move(edge: .top).combined(with: .opacity))
             .animation(.easeInOut(duration: 0.25), value: message)
@@ -332,6 +336,8 @@ struct OnlineGameView: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("Board \(idx + 1)")
+                    .accessibilityIdentifier("game.board\(idx + 1).title")
+                    .accessibilityValue("\(cards.count)")
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(isActive ? Theme.brandRed : .primary)
                 if isActive && gs.phase == .announcing {
@@ -600,6 +606,7 @@ struct OnlineGameView: View {
                     .stroke(borderColor, lineWidth: borderWidth)
             )
             .offset(y: isSelected ? -10 : 0)
+            .accessibilityIdentifier("game.hand.card\(idx)")
             .animation(.easeOut(duration: 0.15), value: isSelected)
             .onTapGesture {
                 if faceDown {
@@ -846,6 +853,7 @@ struct OnlineGameView: View {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(.green)
                 Text("Manche \(gs.mancheNumber) terminée")
+                    .accessibilityIdentifier("game.mancheEnd")
                     .font(.subheadline.weight(.bold))
                 Spacer()
             }
@@ -908,6 +916,7 @@ struct OnlineGameView: View {
                         .modifier(PrimaryButtonStyle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("game.nextManche")
             } else {
                 Label("En attente que l'hôte démarre la suivante…", systemImage: "hourglass")
                     .font(.subheadline)
@@ -1204,6 +1213,7 @@ struct OnlineGameView: View {
                     let label = navLabelForActiveBoard(gs)
                     let bg: Color = remaining <= 5 ? .red : .orange
                     Text("\(label) · \(remaining)s")
+                        .accessibilityIdentifier("game.phaseLabel")
                         .font(.subheadline.weight(.bold))
                         .foregroundStyle(.white)
                         .monospacedDigit()
@@ -1212,6 +1222,7 @@ struct OnlineGameView: View {
                 }
             } else {
                 Text(phaseLabel(gs.phase))
+                    .accessibilityIdentifier("game.phaseLabel")
                     .font(.subheadline.weight(.bold))
             }
         }

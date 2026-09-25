@@ -142,6 +142,7 @@ struct OnlineLobbyView: View {
                 }
             }
         }
+        .accessibilityIdentifier("lobby.root")
         .listStyle(.insetGrouped)
         .listSectionSpacing(.compact)
         .contentMargins(.top, 4, for: .scrollContent)
@@ -205,6 +206,7 @@ struct OnlineLobbyView: View {
                     .font(.subheadline.weight(.semibold))
             }
             .tint(Theme.brandRed)
+            .accessibilityIdentifier("lobby.leave")
         }
     }
 
@@ -225,6 +227,7 @@ struct OnlineLobbyView: View {
                     }
                 }
                 .tint(Theme.brandRed)
+                .accessibilityIdentifier("lobby.start")
                 .disabled(!canStart)
                 .opacity(canStart ? 1 : 0.35)
             }
@@ -250,6 +253,7 @@ struct OnlineLobbyView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.5)
                     .padding(.bottom, 2)
+                    .accessibilityIdentifier("lobby.code")
 
                 Button {
                     UIPasteboard.general.string = code
@@ -272,6 +276,7 @@ struct OnlineLobbyView: View {
                     .foregroundStyle(Color(.systemBackground))
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("lobby.copyCode")
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 16)
@@ -387,6 +392,7 @@ struct OnlineLobbyView: View {
                 Text("\(players.count)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("lobby.playerCount")
             }
         }
     }

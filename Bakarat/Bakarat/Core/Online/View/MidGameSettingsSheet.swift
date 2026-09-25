@@ -96,6 +96,7 @@ struct MidGameSettingsSheet: View {
                     } label: {
                         Label("Quitter la partie", systemImage: "rectangle.portrait.and.arrow.right")
                     }
+                    .accessibilityIdentifier("settings.leave")
                 }
             }
             .listStyle(.insetGrouped)

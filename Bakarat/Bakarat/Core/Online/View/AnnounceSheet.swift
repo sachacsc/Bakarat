@@ -60,6 +60,7 @@ struct AnnouncePanel: View {
                 }
             }
         }
+        .accessibilityIdentifier("announce.panel")
     }
 
     @ViewBuilder
@@ -94,6 +95,7 @@ struct AnnouncePanel: View {
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)
             Text("Annonce envoyée — en attente des autres joueurs.")
+                .accessibilityIdentifier("announce.submitted")
                 .font(.subheadline)
         }
         .padding(.vertical, 14)
@@ -169,6 +171,7 @@ struct AnnouncePanel: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier("announce.cat.\(cat.id)")
         .foregroundStyle(.primary)
     }
 
@@ -192,6 +195,7 @@ struct AnnouncePanel: View {
             .foregroundStyle(.white)
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier("announce.confirm")
         .disabled(!canConfirm)
     }
 
@@ -235,6 +239,7 @@ struct AnnouncePanel: View {
                     )
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("announce.confirm")
 
             if showSkip {
                 Button(action: onSkip) {
@@ -244,6 +249,7 @@ struct AnnouncePanel: View {
                         .frame(maxWidth: .infinity, minHeight: 44)
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("announce.skip")
             }
         }
         .padding(.top, 4)
