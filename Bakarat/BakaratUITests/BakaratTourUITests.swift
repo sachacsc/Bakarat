@@ -215,7 +215,19 @@ final class BakaratTourUITests: XCTestCase {
     /// Libellé de nav pendant les annonces du board N : « BN · 27s »
     /// (OnlineGameView.navLabelForActiveBoard).
     private func isAnnouncing(board: Int) -> Bool {
-        phaseLabel.hasPrefix("B\(board) ")
+        // Sans timer, le libellé est « Annonces » : le board actif est porté
+        // par la VALEUR d'accessibilité (« B1 »…), avec ou sans timer.
+        let label = phaseLabel
+        if label.hasPrefix("B\(board) ") { return true }
+        guard label.hasPrefix("Annonces") else { return false }
+        return phaseValue == "B\(board)"
+    }
+
+    /// Valeur d'accessibilité du libellé de phase (« B1 », « Split »…).
+    private var phaseValue: String {
+        let el = element("game.phaseLabel")
+        guard el.exists else { return "" }
+        return (el.value as? String) ?? ""
     }
 
     /// Vrai quand la partie a dépassé le board N : annonces d'un board
@@ -226,7 +238,10 @@ final class BakaratTourUITests: XCTestCase {
         if label.hasPrefix("Fin de manche") || label.hasPrefix("Split")
             || label.hasPrefix("Tie-break") { return true }
         if board < 3 {
-            return ((board + 1)...3).contains { label.hasPrefix("B\($0) ") }
+            let value = phaseValue
+            return ((board + 1)...3).contains {
+                label.hasPrefix("B\($0) ") || (label.hasPrefix("Annonces") && value == "B\($0)")
+            }
         }
         return false
     }

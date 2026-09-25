@@ -1239,6 +1239,7 @@ struct OnlineGameView: View {
                     let bg: Color = remaining <= 5 ? .red : .orange
                     Text("\(label) · \(remaining)s")
                         .accessibilityIdentifier("game.phaseLabel")
+                        .accessibilityValue(label)
                         .font(.subheadline.weight(.bold))
                         .foregroundStyle(.white)
                         .monospacedDigit()
@@ -1248,6 +1249,10 @@ struct OnlineGameView: View {
             } else {
                 Text(phaseLabel(gs.phase))
                     .accessibilityIdentifier("game.phaseLabel")
+                    // Valeur d'accessibilité = board actif (« B1 »… ou « Split »),
+                    // même sans timer : le tour s'en sert pour savoir quel board
+                    // attend l'annonce.
+                    .accessibilityValue(navLabelForActiveBoard(gs))
                     .font(.subheadline.weight(.bold))
             }
         }
