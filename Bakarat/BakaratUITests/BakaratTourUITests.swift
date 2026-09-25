@@ -663,11 +663,22 @@ final class BakaratTourUITests: XCTestCase {
         // La soumission est partie si : état « envoyée », ou le bouton
         // « Confirmer » / le panneau a disparu, ou la manche est finie.
         // (La puce ⏳/✓ de l'hôte n'a pas d'identifiant — non utilisée.)
-        let accepted = waitFor(Wait.reveal) {
-            self.element("announce.submitted").exists
-                || self.isPast(board: board)
-                || !self.isAnnouncing(board: board)
-                || !self.confirmButton.exists
+        // Un tap peut se perdre sur un simulateur lent (animation de sélection
+        // de carte en cours) : on retape jusqu'à 3 fois, 12 s d'attente à chaque
+        // fois, avant de conclure que l'annonce n'est pas partie.
+        var accepted = false
+        for attempt in 1...3 {
+            accepted = waitFor(attempt == 3 ? Wait.reveal : 12) {
+                self.element("announce.submitted").exists
+                    || self.isPast(board: board)
+                    || !self.isAnnouncing(board: board)
+                    || !self.confirmButton.exists
+            }
+            if accepted { break }
+            if confirmButton.exists {
+                shot("\(pad(step))-annonce-b\(board)-retap-\(attempt)")
+                _ = tap(confirmButton, timeout: 3)
+            }
         }
         if !accepted {
             diag("\(pad(step))-DIAG-annonce-non-envoyee-b\(board)")
