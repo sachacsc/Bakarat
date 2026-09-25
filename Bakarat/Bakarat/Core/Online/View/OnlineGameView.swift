@@ -141,8 +141,9 @@ struct OnlineGameView: View {
         }
         .task(id: service.room?.gameState?.hands[mySeat() ?? -1]) {
             let h = service.room?.gameState?.hands[mySeat() ?? -1] ?? []
-            // Les 2 dernières cartes du deal sont publiques en Flash mode.
-            publicCards = Set(h.suffix(2))
+            // En Flash, les k dernières cartes du deal sont publiques
+            // (k = taille de main − 4 : 2 à 6 cartes, 1 à 5, 0 à 4 — RULES.md).
+            publicCards = Set(h.suffix(flashPublicCount))
             await dealHandAnimated(target: h)
         }
         .onChange(of: service.room?.gameState?.currentBoard) {
@@ -239,7 +240,7 @@ struct OnlineGameView: View {
         let myUid = auth.userId
         let active = gs.players.filter {
             $0.inManche &&
-            (gs.hands[$0.seat]?.count ?? 0) >= 2 &&
+            (gs.hands[$0.seat]?.count ?? 0) >= 1 &&
             $0.userId != myUid
         }
         VStack(alignment: .leading, spacing: 8) {
@@ -267,7 +268,9 @@ struct OnlineGameView: View {
                             .font(.subheadline)
                         Spacer()
                         HStack(spacing: 4) {
-                            ForEach(Array((gs.hands[p.seat] ?? []).suffix(2)), id: \.self) { c in
+                            // Côté invité, le serveur ne livre QUE les cartes
+                            // publiques des autres ; côté hôte on tronque.
+                            ForEach(Array((gs.hands[p.seat] ?? []).suffix(flashPublicCount)), id: \.self) { c in
                                 CardImageView(card: c, width: 30)
                             }
                         }
@@ -1382,6 +1385,14 @@ struct OnlineGameView: View {
     private func mySeat(in gs: OnlineGameState) -> Int? {
         guard let uid = auth.userId else { return nil }
         return gs.players.first(where: { $0.userId == uid })?.seat
+    }
+
+    /// Nombre de cartes publiques par joueur en mode Flash : taille de main − 4
+    /// (6 → 2, 5 → 1, 4 → 0). Cf. RULES.md § « Mode Flash ».
+    private var flashPublicCount: Int {
+        guard let gs = service.room?.gameState else { return 0 }
+        let active = gs.players.filter { $0.inManche }.count
+        return max(0, OnlineDealer.cardsPerPlayer(activeCount: active) - 4)
     }
 
     private func mySeat() -> Int? {

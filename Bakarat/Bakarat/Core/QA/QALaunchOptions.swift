@@ -96,6 +96,9 @@ enum QALaunchOptions {
     /// `-autoStartAt N` : l'hôte démarre la partie dès que N participants sont
     /// dans le lobby (bots compris).
     static var autoStartAt: Int? { value(for: "-autoStartAt").flatMap(Int.init) }
+    /// `-autoStartDelay S` : secondes d'attente avant le démarrage automatique
+    /// (laisse au tour le temps de photographier le lobby rempli).
+    static var autoStartDelay: Double { value(for: "-autoStartDelay").flatMap(Double.init) ?? 0 }
 
     static var chaosName: String? { value(for: "-chaos") }
 

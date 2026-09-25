@@ -176,7 +176,15 @@ struct OnlineLobbyView: View {
             #if DEBUG
             if let n = QALaunchOptions.autoStartAt, service.role == .host,
                let c = count, c >= n, !pendingStart, service.room?.status == .lobby {
-                startGame()
+                let delay = QALaunchOptions.autoStartDelay
+                if delay > 0 {
+                    Task {
+                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        if !pendingStart, service.room?.status == .lobby { startGame() }
+                    }
+                } else {
+                    startGame()
+                }
             }
             #endif
         }
