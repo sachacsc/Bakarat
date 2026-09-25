@@ -460,7 +460,11 @@ final class BakaratTourUITests: XCTestCase {
         if tapIfExists("game.balance", timeout: 8) {
             settle(1.2)
             shot("11-solde-historique")
-            let sheetOpened = app.navigationBars["Solde & historique"].waitForExistence(timeout: 6)
+            var sheetOpened = app.navigationBars["Solde & historique"].waitForExistence(timeout: 6)
+            if !sheetOpened, tapIfExists("game.balance", timeout: 3) {
+                // Un tap peut se perdre pendant la transition de fin de manche : on retente une fois.
+                sheetOpened = app.navigationBars["Solde & historique"].waitForExistence(timeout: 8)
+            }
             if !sheetOpened {
                 diag("11-DIAG-solde-absent")
                 XCTFail("le bouton € doit ouvrir « Solde & historique »")
