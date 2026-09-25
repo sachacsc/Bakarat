@@ -606,6 +606,11 @@ struct OnlineGameView: View {
                     .stroke(borderColor, lineWidth: borderWidth)
             )
             .offset(y: isSelected ? -10 : 0)
+            // XCUITest : une Image SwiftUI décorative n'est pas un élément
+            // d'accessibilité — sans `accessibilityElement()` l'identifiant
+            // « game.hand.cardN » n'est jamais exposé au tour.
+            .accessibilityElement()
+            .accessibilityLabel(Text(faceDown ? "Carte face cachée" : c.description))
             .accessibilityIdentifier("game.hand.card\(idx)")
             .animation(.easeOut(duration: 0.15), value: isSelected)
             .onTapGesture {

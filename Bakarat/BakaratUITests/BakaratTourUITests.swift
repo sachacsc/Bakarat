@@ -13,11 +13,18 @@
 //
 //  Le tour PHOTOGRAPHIE (`tour-<mode>-NN-…`), il ne juge pas : la relecture
 //  visuelle est `scripts/online-judge.py` (T36). Ses assertions sont des
-//  assertions d'EXPÉRIENCE — « le lobby se remplit en moins de 20 s », « les
-//  15 cartes arrivent en moins de 40 s », « la partie survit au verrouillage ».
-//  Un échec produit une capture `*-FAIL-*` ou `*-DIAG-*` et le tour CONTINUE
+//  assertions d'EXPÉRIENCE — « le lobby se remplit », « les 15 cartes
+//  arrivent », « la partie survit au verrouillage ».
+//  Un échec produit une capture `*-DIAG-*` **et** un dump de la hiérarchie
+//  d'accessibilité (`*-hierarchie`), puis le tour CONTINUE
 //  (`continueAfterFailure = true`) : on veut le film entier, pas le premier
-//  pixel fautif.
+//  pixel fautif — et de quoi corriger sans rejouer.
+//
+//  Tempo : le tour est PATIENT, pas rapide. Sur une machine chargée l'app
+//  met parfois 90 s à peindre son premier écran, et la boucle d'hôte
+//  (publish CAS + poll) avance au rythme du réseau. Les délais sont donc
+//  généreux (`Wait`) — un `waitFor` rend la main dès que la condition est
+//  vraie, un délai long ne coûte rien quand tout va bien.
 //
 //  Lancé par `scripts/online-loop.sh` deux fois (clair puis sombre) via
 //  `TEST_RUNNER_TOUR_MODE`.
@@ -28,6 +35,24 @@ import XCTest
 final class BakaratTourUITests: XCTestCase {
 
     private var app: XCUIApplication!
+
+    /// Les délais du tour, en un seul endroit.
+    private enum Wait {
+        /// Premier écran après `launch()` : connexion + `room_create` + peinture.
+        static let lobby: TimeInterval = 180
+        /// Les 2 bots rejoignent (et `-autoStartAt 3` démarre aussitôt).
+        static let players: TimeInterval = 60
+        /// La main du joueur (6 cartes).
+        static let hand: TimeInterval = 60
+        /// Les 15 cartes communautaires (flop/turn/river des 3 boards).
+        static let boards: TimeInterval = 90
+        /// Le panneau d'annonce du board courant.
+        static let announce: TimeInterval = 60
+        /// Reveal du board courant / passage au board suivant.
+        static let reveal: TimeInterval = 60
+        /// Récap de fin de manche.
+        static let mancheEnd: TimeInterval = 120
+    }
 
     /// Injecté par le runner — nomme les captures (`tour-light-…`).
     private var mode: String { ProcessInfo.processInfo.environment["TOUR_MODE"] ?? "light" }
@@ -83,6 +108,23 @@ final class BakaratTourUITests: XCTestCase {
         add(attachment)
     }
 
+    /// Le dump de la hiérarchie d'accessibilité — tronqué à 20 000 caractères.
+    /// C'est LUI qui permet de corriger un identifiant sans rejouer le tour
+    /// (une capture montre l'écran, pas ce que XCUITest voit).
+    private func attachHierarchy(_ name: String) {
+        let dump = String(app.debugDescription.prefix(20_000))
+        let attachment = XCTAttachment(string: dump)
+        attachment.name = "tour-\(mode)-\(name)-hierarchie"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    /// Capture + hiérarchie : le couple de diagnostic de tout échec d'attente.
+    private func diag(_ name: String) {
+        shot(name)
+        attachHierarchy(name)
+    }
+
     /// Les alertes système vivent dans SpringBoard, pas dans l'app : le
     /// moniteur d'interruption ne les voit qu'au prochain TAP, et une capture
     /// n'en est pas un. On y répond explicitement (leçon Zmeo U-0007).
@@ -112,8 +154,48 @@ final class BakaratTourUITests: XCTestCase {
         app.descendants(matching: .any).matching(identifier: identifier).firstMatch
     }
 
-    /// Attend un écran. En cas d'absence : capture `*-DIAG-*` + échec, puis on
-    /// continue — le tour doit filmer la suite.
+    /// Repli par LABEL quand l'identifiant manque (un conteneur SwiftUI n'est
+    /// pas toujours exposé) : le premier bouton dont le label commence par
+    /// `prefix`.
+    private func button(startingWith prefix: String) -> XCUIElement {
+        app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", prefix)).firstMatch
+    }
+
+    /// L'élément d'identifiant `identifier` s'il existe, sinon le bouton dont
+    /// le label commence par `prefix`.
+    private func resolve(_ identifier: String, orButtonStartingWith prefix: String) -> XCUIElement {
+        let byIdentifier = element(identifier)
+        if byIdentifier.exists { return byIdentifier }
+        return button(startingWith: prefix)
+    }
+
+    /// Le code du salon : `lobby.code`, ou à défaut le premier `staticText`
+    /// fait de 4 caractères majuscules/chiffres.
+    private var roomCodeElement: XCUIElement {
+        let byIdentifier = element("lobby.code")
+        if byIdentifier.exists { return byIdentifier }
+        return app.staticTexts
+            .matching(NSPredicate(format: "label MATCHES %@", "^[A-Z0-9]{4}$"))
+            .firstMatch
+    }
+
+    /// Le bouton « Confirmer : … » du panneau d'annonce.
+    private var confirmButton: XCUIElement {
+        resolve("announce.confirm", orButtonStartingWith: "Confirmer")
+    }
+
+    /// Le bouton « Manche suivante » du récap.
+    private var nextMancheButton: XCUIElement {
+        resolve("game.nextManche", orButtonStartingWith: "Manche suivante")
+    }
+
+    /// Vrai dès que l'écran de jeu est à l'écran (le lobby a été traversé).
+    private var inGame: Bool {
+        element("game.root").exists || element("game.phaseLabel").exists
+    }
+
+    /// Attend un écran. En cas d'absence : `*-DIAG-*` + hiérarchie + échec,
+    /// puis on continue — le tour doit filmer la suite.
     @discardableResult
     private func expectScreen(_ identifier: String,
                               timeout: TimeInterval,
@@ -125,16 +207,26 @@ final class BakaratTourUITests: XCTestCase {
             XCTContext.runActivity(named: "\(identifier) en \(String(format: "%.1f", elapsed)) s") { _ in }
             return true
         }
-        shot("\(name)-DIAG-\(identifier)")
+        diag("\(name)-DIAG-\(identifier)")
         XCTFail("\(reason) — « \(identifier) » toujours absent après \(Int(timeout)) s")
         return false
     }
 
     @discardableResult
     private func tapIfExists(_ identifier: String, timeout: TimeInterval = 5) -> Bool {
-        let el = element(identifier)
-        guard el.waitForExistence(timeout: timeout), el.isHittable else { return false }
-        el.tap()
+        tap(element(identifier), timeout: timeout)
+    }
+
+    @discardableResult
+    private func tap(_ el: XCUIElement, timeout: TimeInterval = 5) -> Bool {
+        guard el.waitForExistence(timeout: timeout) else { return false }
+        if el.isHittable {
+            el.tap()
+        } else {
+            // Un élément d'accessibilité composite peut n'être « hittable »
+            // qu'en son centre — on tape la coordonnée plutôt que d'abandonner.
+            el.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
+        }
         settle(0.6)
         return true
     }
@@ -176,33 +268,52 @@ final class BakaratTourUITests: XCTestCase {
 
         // ── 01 · Le lobby ────────────────────────────────────────────────
         // L'app se connecte, crée le salon et pousse le lobby toute seule.
-        expectScreen("lobby.code", timeout: 60, shot: "01",
-                     because: "le salon doit s'ouvrir sans le moindre geste (-autoCreateRoom)")
+        // Mais le lobby peut déjà être TRAVERSÉ quand on regarde : les deux
+        // bots rejoignent en ~3 s et `-autoStartAt 3` démarre la partie dès le
+        // 3ème joueur. On accepte donc les deux rives — lobby OU partie — et
+        // on reste patient côté peinture du premier écran.
+        let opened = waitFor(Wait.lobby) {
+            self.element("lobby.code").exists || self.inGame
+        }
+        if !opened {
+            diag("01-DIAG-lobby")
+            XCTFail("le salon doit s'ouvrir sans le moindre geste (-autoCreateRoom) — "
+                    + "ni « lobby.code » ni l'écran de jeu après \(Int(Wait.lobby)) s")
+        }
         settle(1)
         shot("01-lobby")
 
-        let code = element("lobby.code")
-        if code.exists {
-            XCTAssertEqual(code.label, roomCode,
-                           "le code affiché doit être celui imposé par -qaRoomCode")
-        }
+        let sawLobby = element("lobby.code").exists
+        if sawLobby {
+            let code = roomCodeElement
+            if code.exists {
+                XCTAssertEqual(code.label, roomCode,
+                               "le code affiché doit être celui imposé par -qaRoomCode")
+            }
 
-        // Les deux bots rejoignent : trois joueurs dans le lobby.
-        let filled = waitFor(20) {
-            let counter = self.element("lobby.playerCount")
-            return counter.exists && (Int(counter.label) ?? 0) >= 3
-        }
-        if !filled {
-            shot("02-DIAG-lobby-incomplet")
-            XCTFail("le lobby doit compter 3 joueurs en moins de 20 s (2 bots + l'hôte)")
+            // Les deux bots rejoignent : trois joueurs dans le lobby. Si la
+            // partie a déjà démarré, le compte a forcément été atteint.
+            let filled = waitFor(Wait.players) {
+                if self.inGame { return true }
+                let counter = self.element("lobby.playerCount")
+                return counter.exists && (Int(counter.label) ?? 0) >= 3
+            }
+            if !filled {
+                diag("02-DIAG-lobby-incomplet")
+                XCTFail("le lobby doit compter 3 joueurs en moins de \(Int(Wait.players)) s "
+                        + "(2 bots + l'hôte)")
+            }
+        } else {
+            XCTContext.runActivity(named: "lobby déjà traversé — la partie avait démarré "
+                                   + "avant la première observation (-autoStartAt 3)") { _ in }
         }
         shot("02-lobby-rempli")
 
         // ── 03 · La distribution ─────────────────────────────────────────
         // `-autoStartAt 3` a lancé la partie : l'écran de jeu remplace le lobby.
-        expectScreen("game.phaseLabel", timeout: 30, shot: "03",
+        expectScreen("game.phaseLabel", timeout: Wait.hand, shot: "03",
                      because: "la partie doit démarrer dès le 3ème joueur")
-        let handDealt = expectScreen("game.hand.card0", timeout: 30, shot: "03",
+        let handDealt = expectScreen("game.hand.card0", timeout: Wait.hand, shot: "03",
                                      because: "la main du joueur doit être distribuée")
         settle(1)
         shot("03-distribution")
@@ -211,7 +322,7 @@ final class BakaratTourUITests: XCTestCase {
         // ── 04 · Flop, turn, river ───────────────────────────────────────
         let dealStart = Date()
         var lastSeen = -1
-        let complete = waitFor(40) {
+        let complete = waitFor(Wait.boards) {
             let total = (1...3).map { self.boardCardCount($0) }.filter { $0 > 0 }.reduce(0, +)
             if total != lastSeen {
                 lastSeen = total
@@ -221,28 +332,47 @@ final class BakaratTourUITests: XCTestCase {
             return self.allBoardsComplete
         }
         if !complete {
-            shot("06-DIAG-board-incomplet")
-            XCTFail("les 15 cartes communautaires doivent être posées en moins de 40 s "
-                    + "(lu : \((1...3).map { boardCardCount($0) }))")
+            diag("06-DIAG-board-incomplet")
+            XCTFail("les 15 cartes communautaires doivent être posées en moins de "
+                    + "\(Int(Wait.boards)) s (lu : \((1...3).map { boardCardCount($0) }))")
         } else {
             XCTContext.runActivity(named: "15 cartes en \(Int(Date().timeIntervalSince(dealStart))) s") { _ in }
         }
         shot("06-river")
 
         // ── 07 · Les trois boards : annoncer, révéler ────────────────────
+        // L'hôte est le SEUL humain : sans ses 3 annonces (une par board) la
+        // manche ne se termine jamais. On attend le panneau à CHAQUE board.
         for board in 1...3 {
             announceOnCurrentBoard(step: 6 + board, board: board)
         }
 
         // ── 10 · Fin de manche ───────────────────────────────────────────
-        let ended = waitFor(90) { self.element("game.mancheEnd").exists }
+        // Un board à égalité rouvre un panneau d'annonce (tie-break) : l'hôte
+        // étant le seul humain, il doit y répondre — sinon la manche ne se
+        // termine jamais et le récap n'arrive pas.
+        var ended = false
+        var tiebreak = 0
+        let mancheDeadline = Date().addingTimeInterval(Wait.mancheEnd)
+        while Date() < mancheDeadline {
+            if element("game.mancheEnd").exists { ended = true; break }
+            if !element("announce.submitted").exists, confirmButton.exists {
+                tiebreak += 1
+                XCTContext.runActivity(named: "tie-break \(tiebreak) — l'hôte réannonce") { _ in }
+                shot("10-tiebreak-\(tiebreak)")
+                tapIfExists("game.hand.card0", timeout: 5)
+                tap(confirmButton, timeout: 5)
+            }
+            settle(0.5)
+        }
+        if !ended { ended = element("game.mancheEnd").exists }
         if !ended {
-            shot("10-DIAG-pas-de-fin-de-manche")
+            diag("10-DIAG-pas-de-fin-de-manche")
             XCTFail("après les 3 boards, la manche doit se terminer (récap + « Manche suivante »)")
         }
         settle(1)
         shot("10-fin-de-manche")
-        XCTAssertTrue(element("game.nextManche").exists,
+        XCTAssertTrue(nextMancheButton.exists,
                       "l'hôte doit pouvoir enchaîner sur la manche suivante")
 
         // ── 11 · Le sheet « Solde & historique » ─────────────────────────
@@ -251,23 +381,23 @@ final class BakaratTourUITests: XCTestCase {
             shot("11-solde-historique")
             let sheetOpened = app.navigationBars["Solde & historique"].waitForExistence(timeout: 6)
             if !sheetOpened {
-                shot("11-DIAG-solde-absent")
+                diag("11-DIAG-solde-absent")
                 XCTFail("le bouton € doit ouvrir « Solde & historique »")
             }
             if app.buttons["Fermer"].exists { app.buttons["Fermer"].tap() }
             settle(0.8)
         } else {
-            shot("11-DIAG-bouton-solde-introuvable")
+            diag("11-DIAG-bouton-solde-introuvable")
             XCTFail("le bouton « Solde & historique » doit rester accessible en fin de manche")
         }
 
         // ── 12 · Manche suivante ─────────────────────────────────────────
-        if tapIfExists("game.nextManche", timeout: 8) {
+        if tap(nextMancheButton, timeout: 8) {
             let redealt = waitFor(60) {
                 self.element("game.hand.card0").exists && !self.element("game.mancheEnd").exists
             }
             if !redealt {
-                shot("12-DIAG-manche-2-absente")
+                diag("12-DIAG-manche-2-absente")
                 XCTFail("« Manche suivante » doit redistribuer une nouvelle manche")
             }
             settle(1)
@@ -305,7 +435,7 @@ final class BakaratTourUITests: XCTestCase {
         let stillThere = element("game.root").waitForExistence(timeout: 20)
             || element("game.phaseLabel").waitForExistence(timeout: 5)
         if !stillThere {
-            shot("14-DIAG-partie-perdue-au-retour")
+            diag("14-DIAG-partie-perdue-au-retour")
             XCTFail("après 15 s en arrière-plan, on doit retrouver la partie — jamais un écran d'entrée")
         }
         XCTAssertFalse(element("play.createOnline").exists,
@@ -317,9 +447,14 @@ final class BakaratTourUITests: XCTestCase {
             settle(1)
             shot("15-reglages")
             if tapIfExists("settings.leave", timeout: 8) {
-                // Confirmation éventuelle (« Quitter la partie ? »).
-                for label in ["Quitter", "Quitter la partie"] {
-                    let confirm = app.buttons[label]
+                // Confirmation éventuelle (« Quitter la partie ? ») : elle vit
+                // dans une alerte / un confirmationDialog. On la cherche LÀ,
+                // jamais dans la page — sinon on retaperait « Quitter la
+                // partie » du sheet lui-même.
+                for container in [app.alerts.firstMatch, app.sheets.firstMatch] where container.exists {
+                    let confirm = container.buttons
+                        .matching(NSPredicate(format: "label BEGINSWITH %@", "Quitter"))
+                        .firstMatch
                     if confirm.waitForExistence(timeout: 2), confirm.isHittable {
                         confirm.tap(); break
                     }
@@ -328,15 +463,15 @@ final class BakaratTourUITests: XCTestCase {
                 shot("15-retour-accueil")
                 let home = element("play.createOnline").waitForExistence(timeout: 20)
                 if !home {
-                    shot("15-DIAG-pas-de-retour-accueil")
+                    diag("15-DIAG-pas-de-retour-accueil")
                     XCTFail("« Quitter la partie » doit ramener à l'accueil")
                 }
             } else {
-                shot("15-DIAG-quitter-introuvable")
+                diag("15-DIAG-quitter-introuvable")
                 XCTFail("le sheet de réglages doit offrir « Quitter la partie »")
             }
         } else {
-            shot("15-DIAG-reglages-introuvables")
+            diag("15-DIAG-reglages-introuvables")
             XCTFail("le bouton de réglages mi-partie doit rester accessible")
         }
 
@@ -345,62 +480,67 @@ final class BakaratTourUITests: XCTestCase {
 
     // MARK: - Une annonce
 
-    /// Annonce sur le board courant : on choisit une carte dans la main (toute
-    /// annonce, Hauteur comprise, exige au moins une carte sélectionnée), on
-    /// laisse la catégorie par défaut (Hauteur auto) ou on prend la première
-    /// proposée, puis on confirme.
+    /// Annonce sur le board courant. L'app EXIGE au moins une carte
+    /// sélectionnée (même pour Hauteur : 0 carte = shake, pas de soumission) —
+    /// on tape donc une carte de la main, puis on confirme sur la catégorie
+    /// par défaut (« Hauteur », auto-pick : aucune pilule à choisir).
     private func announceOnCurrentBoard(step: Int, board: Int) {
-        let opened = waitFor(90) {
-            self.element("announce.panel").exists || self.element("announce.submitted").exists
+        // Le panneau doit être PRÊT À ANNONCER : présent, et pas encore dans
+        // son état « envoyée » (qui peut être un résidu du board précédent).
+        let ready = waitFor(Wait.announce) {
+            !self.element("announce.submitted").exists
+                && (self.element("announce.panel").exists || self.confirmButton.exists)
         }
-        if !opened {
-            shot("\(pad(step))-DIAG-annonce-b\(board)-absente")
+        if !ready {
+            if element("announce.submitted").exists {
+                // Déjà soumis (timer, ou tour rejoué) : rien à faire.
+                shot("\(pad(step))-annonce-b\(board)-deja-envoyee")
+                return
+            }
+            diag("\(pad(step))-DIAG-annonce-b\(board)-absente")
             XCTFail("le panneau d'annonce du Board \(board) doit s'ouvrir")
             return
         }
         settle(0.8)
         shot("\(pad(step))-annonce-b\(board)")
 
-        guard !element("announce.submitted").exists else {
-            // Déjà soumis (timer, ou tour rejoué) : rien à faire.
-            return
-        }
-
         // 1 carte de la main suffit — le kicker est complété par l'app.
         if !tapIfExists("game.hand.card0", timeout: 8) {
-            shot("\(pad(step))-DIAG-main-intappable-b\(board)")
+            diag("\(pad(step))-DIAG-main-intappable-b\(board)")
             XCTFail("les cartes de la main doivent être sélectionnables pendant l'annonce")
         }
-        // Catégorie : « Hauteur » est l'auto-pick par défaut (pas de pilule
-        // dans la grille) ; on prend « Paire » si elle est proposée, sinon on
-        // reste sur le défaut.
-        _ = tapIfExists("announce.cat.pair", timeout: 2)
+        // Catégorie : on reste sur le défaut « Hauteur » (auto-pick). Choisir
+        // une pilule exigerait une main compatible — le tour ne parie pas.
         settle(0.4)
         shot("\(pad(step))-annonce-b\(board)-choisie")
 
-        if !tapIfExists("announce.confirm", timeout: 8) {
-            shot("\(pad(step))-DIAG-confirm-absent-b\(board)")
+        if !tap(confirmButton, timeout: 8) {
+            diag("\(pad(step))-DIAG-confirm-absent-b\(board)")
             XCTFail("le bouton « Confirmer » doit être là pendant l'annonce")
             return
         }
 
-        let accepted = waitFor(20) {
-            self.element("announce.submitted").exists || !self.element("announce.panel").exists
+        let accepted = waitFor(Wait.reveal) {
+            self.element("announce.submitted").exists
+                || self.element("game.mancheEnd").exists
+                || !self.element("announce.panel").exists
         }
         if !accepted {
-            shot("\(pad(step))-DIAG-annonce-non-prise-b\(board)")
+            diag("\(pad(step))-DIAG-annonce-non-prise-b\(board)")
             XCTFail("après « Confirmer », l'annonce doit être enregistrée")
         }
         shot("\(pad(step))-annonce-b\(board)-envoyee")
 
         // Le reveal du board : les bots annoncent en 1-3 s, l'hôte résout.
-        let revealed = waitFor(60) {
+        // Board 1 et 2 → le board suivant repasse en annonces (le panneau
+        // redevient vierge) ; board 3 → fin de manche.
+        let revealed = waitFor(Wait.reveal) {
             self.phaseLabel.contains("Reveal") || self.element("game.mancheEnd").exists
-                || (board < 3 && self.phaseLabel.contains("Annonces")
-                    && !self.element("announce.submitted").exists)
+                || (board < 3 && !self.element("announce.submitted").exists
+                    && self.confirmButton.exists)
         }
         if !revealed {
-            shot("\(pad(step))-DIAG-reveal-b\(board)")
+            diag("\(pad(step))-DIAG-reveal-b\(board)")
             XCTFail("le Board \(board) doit être révélé une fois toutes les annonces reçues")
         }
         settle(1)

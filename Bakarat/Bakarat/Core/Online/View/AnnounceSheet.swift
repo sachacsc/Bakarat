@@ -60,6 +60,11 @@ struct AnnouncePanel: View {
                 }
             }
         }
+        // XCUITest : un conteneur SwiftUI (VStack) n'est PAS un élément
+        // d'accessibilité — sans `children: .contain` l'identifiant
+        // « announce.panel » n'existe pas pour le tour. `.contain` laisse les
+        // enfants (catégories, Confirmer) exposés tels quels.
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("announce.panel")
     }
 
