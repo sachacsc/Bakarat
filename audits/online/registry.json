@@ -299,9 +299,9 @@
       "title": "Le run du 2026-09-28 15:00 n'a produit aucune capture et aucun résultat de test : la loop n'a rien vérifié aujourd'hui.",
       "expected": "Chaque run devrait au moins exécuter les suites et remonter un résultat pass/fail réel ; un run vide devrait être signalé comme un échec d'infra, pas silencieusement classé 'rien à dire'.",
       "status": "still",
-      "seen": 7,
+      "seen": 8,
       "first_seen": "2026-09-28",
-      "last_seen": "2026-10-04",
+      "last_seen": "2026-10-05",
       "gone_streak": 0,
       "kind": "chaos"
     }
