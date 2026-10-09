@@ -38,16 +38,16 @@ enum HandCategory: Int, CaseIterable, Codable {
 
     var label: String {
         switch self {
-        case .highcard:  return "Hauteur"
-        case .pair:      return "Paire"
-        case .twopair:   return "Double paire"
-        case .trips:     return "Brelan"
-        case .straight:  return "Suite"
-        case .flush:     return "Couleur"
-        case .fullhouse: return "Full"
-        case .quads:     return "Carré"
-        case .sflush:    return "Quinte flush"
-        case .royal:     return "Royale"
+        case .highcard:  return String(localized: "Hauteur")
+        case .pair:      return String(localized: "Paire")
+        case .twopair:   return String(localized: "Double paire")
+        case .trips:     return String(localized: "Brelan")
+        case .straight:  return String(localized: "Suite")
+        case .flush:     return String(localized: "Couleur")
+        case .fullhouse: return String(localized: "Full")
+        case .quads:     return String(localized: "Carré")
+        case .sflush:    return String(localized: "Quinte flush")
+        case .royal:     return String(localized: "Royale")
         }
     }
 

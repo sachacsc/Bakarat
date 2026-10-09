@@ -97,7 +97,10 @@ final class QABotRunner {
         }
 
         var email: String { "bakaratqa.g\(index)@bakarat.test" }
-        var displayName: String { "Bot \(index)" }
+        var displayName: String {
+            let names = QALaunchOptions.botNames
+            return (index - 1) < names.count ? names[index - 1] : "Bot \(index)"
+        }
 
         func start() {
             task = Task { [weak self] in

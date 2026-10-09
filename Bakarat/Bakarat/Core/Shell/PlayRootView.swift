@@ -163,6 +163,7 @@ struct PlayRootView: View {
                 )
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("play.createCounter")
             .listRowInsets(EdgeInsets(top: 14, leading: 16, bottom: 14, trailing: 16))
         } header: {
             Text("Counter")
@@ -407,6 +408,7 @@ struct PlayRootView: View {
     }
 
     private func displayName() -> String {
+        if let forced = QALaunchOptions.displayNameOverride, !forced.isEmpty { return forced }
         if let n = auth.profile?.displayName, !n.isEmpty { return n }
         if let e = auth.userEmail, let local = e.split(separator: "@").first { return String(local) }
         return "Joueur"

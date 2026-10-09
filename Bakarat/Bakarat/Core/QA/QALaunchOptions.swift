@@ -102,6 +102,14 @@ enum QALaunchOptions {
 
     static var chaosName: String? { value(for: "-chaos") }
 
+    /// `-qaDisplayName X` : nom affiché dans les salons (captures App Store :
+    /// « Sacha » plutôt que « QA-host »).
+    static var displayNameOverride: String? { value(for: "-qaDisplayName") }
+    /// `-qaBotNames "Léa,Marc"` : noms des bots, dans l'ordre (défaut « Bot N »).
+    static var botNames: [String] {
+        (value(for: "-qaBotNames") ?? "").split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
     /// Profil chaos résolu (nil si inconnu ou absent).
     static var chaosProfile: ChaosProfile? {
         guard let name = chaosName else { return nil }

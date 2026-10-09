@@ -125,12 +125,12 @@ struct OnlineHistoryView: View {
     private func subtitle(for g: GameHistoryItem) -> String {
         var parts: [String] = []
         if g.numParticipants > 0 {
-            parts.append("\(g.numParticipants) joueur\(g.numParticipants > 1 ? "s" : "")")
+            parts.append((g.numParticipants > 1 ? String(localized: "\(g.numParticipants) joueurs") : String(localized: "1 joueur")))
         }
         if g.numManches > 0 {
-            parts.append("\(g.numManches) manche\(g.numManches > 1 ? "s" : "")")
+            parts.append((g.numManches > 1 ? String(localized: "\(g.numManches) manches") : String(localized: "1 manche")))
         } else {
-            parts.append("Aucune manche")
+            parts.append(String(localized: "Aucune manche"))
         }
         return parts.joined(separator: " · ")
     }

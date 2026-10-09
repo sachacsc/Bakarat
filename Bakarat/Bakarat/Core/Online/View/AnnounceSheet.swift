@@ -208,16 +208,16 @@ struct AnnouncePanel: View {
     /// résultat dans les autres écrans).
     private func shortLabel(_ cat: HandCategory) -> String {
         switch cat {
-        case .highcard:  return "Hauteur"
-        case .pair:      return "Paire"
-        case .twopair:   return "2 Paires"
-        case .trips:     return "Brelan"
-        case .straight:  return "Suite"
-        case .flush:     return "Couleur"
-        case .fullhouse: return "Full"
-        case .quads:     return "Carré"
-        case .sflush:    return "Q. Flush"
-        case .royal:     return "Royale"
+        case .highcard:  return String(localized: "Hauteur")
+        case .pair:      return String(localized: "Paire")
+        case .twopair:   return String(localized: "2 Paires")
+        case .trips:     return String(localized: "Brelan")
+        case .straight:  return String(localized: "Suite")
+        case .flush:     return String(localized: "Couleur")
+        case .fullhouse: return String(localized: "Full")
+        case .quads:     return String(localized: "Carré")
+        case .sflush:    return String(localized: "Q. Flush")
+        case .royal:     return String(localized: "Royale")
         }
     }
 
@@ -266,9 +266,11 @@ struct AnnouncePanel: View {
     private var canConfirm: Bool { true }
 
     private var confirmLabel: String {
-        let label = effectiveCategory?.label ?? "Hauteur"
+        let label = effectiveCategory?.label ?? String(localized: "Hauteur")
         let n = selectedCards.count
-        if n == 0 { return "Confirmer : \(label)" }
-        return "Confirmer : \(label) (\(n) carte\(n > 1 ? "s" : ""))"
+        if n == 0 { return String(localized: "Confirmer : \(label)") }
+        return n > 1
+            ? String(localized: "Confirmer : \(label) (\(n) cartes)")
+            : String(localized: "Confirmer : \(label) (1 carte)")
     }
 }

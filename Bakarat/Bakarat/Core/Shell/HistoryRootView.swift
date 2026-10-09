@@ -217,7 +217,8 @@ struct HistoryRootView: View {
                 Text(agg.displayName)
                     .font(.system(size: 16, weight: .semibold))
                 let n = agg.contributingGameIds.count
-                Text((agg.direction == .iOwe ? "You owe them" : "Owes you") + " · \(n) game\(n > 1 ? "s" : "")")
+                Text((agg.direction == .iOwe ? String(localized: "You owe them") : String(localized: "Owes you"))
+                     + " · " + (n > 1 ? String(localized: "%lld games", defaultValue: "\(n) games") : String(localized: "1 game")))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -494,15 +495,19 @@ struct CloudSessionRow: View {
     }
 
     private var titleLabel: String {
-        if session.mode == "online" { return "Partie online" }
-        return session.ownerDisplay.map { "Compteur · \($0)" } ?? "Compteur partagé"
+        if session.mode == "online" { return String(localized: "Partie online") }
+        return session.ownerDisplay.map { String(localized: "Compteur · \($0)") } ?? String(localized: "Compteur partagé")
     }
 
     private var subtitleLabel: String {
         var parts: [String] = []
-        parts.append("\(session.numParticipants) joueur\(session.numParticipants > 1 ? "s" : "")")
+        parts.append(session.numParticipants > 1
+                     ? String(localized: "\(session.numParticipants) joueurs")
+                     : String(localized: "1 joueur"))
         if session.numManches > 0 {
-            parts.append("\(session.numManches) manche\(session.numManches > 1 ? "s" : "")")
+            parts.append(session.numManches > 1
+                         ? String(localized: "\(session.numManches) manches")
+                         : String(localized: "1 manche"))
         }
         parts.append(session.lastActivity.formatted(.relative(presentation: .named)))
         return parts.joined(separator: " · ")

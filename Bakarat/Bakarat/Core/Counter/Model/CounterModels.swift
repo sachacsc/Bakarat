@@ -233,10 +233,10 @@ extension Counter {
     var subtitle: String {
         var parts: [String] = []
         if !manches.isEmpty {
-            parts.append("\(manches.count) manche\(manches.count > 1 ? "s" : "")")
+            parts.append((manches.count > 1 ? String(localized: "\(manches.count) manches") : String(localized: "1 manche")))
         }
         if !players.isEmpty {
-            parts.append("\(players.count) joueur\(players.count > 1 ? "s" : "")")
+            parts.append((players.count > 1 ? String(localized: "\(players.count) joueurs") : String(localized: "1 joueur")))
         }
         parts.append(lastUsedAt.formatted(.relative(presentation: .named)))
         return parts.joined(separator: " · ")
