@@ -299,9 +299,9 @@
       "title": "Le run du 2026-09-28 15:00 n'a produit aucune capture et aucun résultat de test : la loop n'a rien vérifié aujourd'hui.",
       "expected": "Chaque run devrait au moins exécuter les suites et remonter un résultat pass/fail réel ; un run vide devrait être signalé comme un échec d'infra, pas silencieusement classé 'rien à dire'.",
       "status": "still",
-      "seen": 11,
+      "seen": 12,
       "first_seen": "2026-09-28",
-      "last_seen": "2026-10-08",
+      "last_seen": "2026-10-09",
       "gone_streak": 0,
       "kind": "chaos"
     },
@@ -312,10 +312,10 @@
       "element": "les suites unit, tour-light, tour-dark, duel-host et duel-guest, toutes à result \"unknown\" (0 test, 0.0 s), et la fin de build.log (« Destinations incompatible with the \"Bakarat\" scheme »)",
       "title": "Le run du 2026-10-08 15:00 est vide pour la deuxième fois de suite : build.log s'arrête sur un échec de destination du scheme Bakarat, et shots/ ne contient aucune capture.",
       "expected": "Chaque run lance les simulateurs et produit des captures et des résultats de test. Quand la loop ne peut pas tester, elle le signale comme une panne explicite, pas comme un run silencieux sans résultat.",
-      "status": "open",
-      "seen": 1,
+      "status": "still",
+      "seen": 2,
       "first_seen": "2026-10-08",
-      "last_seen": "2026-10-08",
+      "last_seen": "2026-10-09",
       "gone_streak": 0,
       "kind": "chaos"
     }
