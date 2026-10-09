@@ -16,7 +16,7 @@ struct PrivacyPolicyView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Text("Privacy Policy")
                     .font(.title2.weight(.bold))
-                Text("Last updated: May 18, 2026")
+                Text("Last updated: October 9, 2026")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -48,8 +48,8 @@ struct PrivacyPolicyView: View {
                             """
                             You can at any time:
                             • Sign out from the Profile tab.
-                            • Request complete deletion of your account and all your data by emailing sacha.csc@gmail.com.
-                            • Request a copy of your data.
+                            • Delete your account and all your data yourself, immediately, from the Profile tab (“Delete my account”).
+                            • Request a copy of your data by emailing sacha.csc@gmail.com.
                             """)
 
                     section("Contact",
@@ -66,11 +66,15 @@ struct PrivacyPolicyView: View {
     }
 
     @ViewBuilder
-    private func section(_ title: String, _ body: String) -> some View {
+    private func section(_ title: LocalizedStringKey, _ body: String.LocalizationValue) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.headline)
-            Text(try! AttributedString(markdown: body, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            // Text(LocalizedStringKey) interprète déjà le markdown inline, mais on
+            // garde le rendu AttributedString d'origine (espaces préservés).
+            Text((try? AttributedString(markdown: String(localized: body),
+                                        options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                 ?? AttributedString(String(localized: body)))
                 .font(.subheadline)
                 .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)

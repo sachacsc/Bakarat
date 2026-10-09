@@ -185,9 +185,16 @@ struct OnlineGameView: View {
 
     // MARK: - Bannière d'état (reconnexion / relève d'hôte)
 
-    @ViewBuilder
     private var statusBanner: some View {
-        if let message = bannerMessage {
+        // Tick 1 s : fait expirer la bannière « Reconnecté » (4 s) sans timer dédié.
+        TimelineView(.periodic(from: .now, by: 1)) { ctx in
+            bannerBody(message: bannerMessage(now: ctx.date))
+        }
+    }
+
+    @ViewBuilder
+    private func bannerBody(message: String?) -> some View {
+        if let message {
             HStack(spacing: 8) {
                 if service.connectionState != .connected {
                     ProgressView().controlSize(.mini).tint(.white)
@@ -207,9 +214,13 @@ struct OnlineGameView: View {
         }
     }
 
-    private var bannerMessage: String? {
-        if service.connectionState == .offline { return "Hors ligne — reconnexion…" }
-        if service.connectionState == .reconnecting || service.isReconnecting { return "Reconnexion…" }
+    private func bannerMessage(now: Date) -> String? {
+        if service.connectionState == .offline { return String(localized: "Hors ligne — reconnexion…") }
+        if service.connectionState == .reconnecting || service.isReconnecting { return String(localized: "Reconnexion…") }
+        if let at = service.lastReconnectedAt, now.timeIntervalSince(at) < 4 {
+            let phase = phaseLabel(service.room?.gameState?.phase ?? .dealing)
+            return String(localized: "Reconnecté — \(phase)")
+        }
         return hostChangeMessage
     }
 
@@ -1439,15 +1450,15 @@ struct OnlineGameView: View {
 
     private func phaseLabel(_ p: GamePhase) -> String {
         switch p {
-        case .dealing:             return "Distribution…"
-        case .flop:                return "Brûle + Flop"
-        case .turn:                return "Brûle + Turn"
-        case .river:               return "Brûle + River"
-        case .announcing:          return "Annonces"
-        case .boardReveal:         return "Reveal"
-        case .tiebreakAnnouncing:  return "Tie-break — annonces"
-        case .tiebreakReveal:      return "Tie-break — reveal"
-        case .mancheEnd:           return "Fin de manche"
+        case .dealing:             return String(localized: "Distribution…")
+        case .flop:                return String(localized: "Brûle + Flop")
+        case .turn:                return String(localized: "Brûle + Turn")
+        case .river:               return String(localized: "Brûle + River")
+        case .announcing:          return String(localized: "Annonces")
+        case .boardReveal:         return String(localized: "Révélation")
+        case .tiebreakAnnouncing:  return String(localized: "Tie-break — annonces")
+        case .tiebreakReveal:      return String(localized: "Tie-break — révélation")
+        case .mancheEnd:           return String(localized: "Fin de manche")
         }
     }
 

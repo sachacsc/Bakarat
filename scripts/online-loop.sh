@@ -15,13 +15,17 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT="$REPO/Bakarat/Bakarat.xcodeproj"
 SCHEME="Bakarat"
 DATE="$(date +%Y-%m-%d-%H%M)"
-OUT="$REPO/audits/online/$DATE"
+# BAKARAT_LOOP_OUT : rejouer l'export/summary sur un run existant (--skip-build --only export).
+OUT="${BAKARAT_LOOP_OUT:-$REPO/audits/online/$DATE}"
 # JAMAIS dans /tmp : macOS purge les fichiers inactifs et ampute la DerivedData
 # en silence (leçon Zmeo — plusieurs runs à zéro pour cette raison).
 DERIVED="$HOME/Library/Caches/bakarat-loop-dd"
 mkdir -p "$OUT"
 
 log() { echo "[online-loop] $*"; }
+# Variante stderr pour les fonctions dont stdout est capturé par $(...)
+# (find_or_create_sim : le « sim créé » finissait dans l'identifiant → build KO).
+logerr() { echo "[online-loop] $*" >&2; }
 
 # ── Options ──────────────────────────────────────────────────────────────────
 SKIP_BUILD=0
@@ -57,9 +61,12 @@ find_or_create_sim() {
   id=$(xcrun simctl list devices | grep "$name (" | grep -oE "[0-9A-F-]{36}" | head -1 || true)
   if [ -z "$id" ]; then
     local runtime
-    runtime=$(xcrun simctl list runtimes | grep -oE "com.apple.CoreSimulator.SimRuntime.iOS-26-5" | tail -1)
+    # Dernier runtime iOS disponible (le 26.5 a été purgé le 2026-10-05 : cinq
+    # runs à zéro parce que ce grep ne trouvait plus rien).
+    runtime=$(xcrun simctl list runtimes available | grep -oE "com.apple.CoreSimulator.SimRuntime.iOS-[0-9-]+" | sort -t- -k5,5n -k6,6n | tail -1)
+    [ -n "$runtime" ] || { logerr "aucun runtime iOS disponible"; exit 1; }
     id=$(xcrun simctl create "$name" "$DEVTYPE" "$runtime")
-    log "sim créé : $name → $id"
+    logerr "sim créé : $name → $id"
   fi
   echo "$id"
 }
@@ -200,6 +207,17 @@ fi
 # seule du build, écriture isolée des résultats). Le guest démarre 8 s après
 # l'hôte pour laisser le salon QATEST exister avant le join.
 if want duel; then
+  # Purge du salon QATE de la veille : sinon l'invité (+8 s) peut rejoindre
+  # l'ANCIEN salon avant que l'hôte recrée le sien (C-0003), et depuis la
+  # migration 20261009190000 room_create refuse d'écraser un salon où un
+  # membre est encore vu < 60 s (CODE_TAKEN → duel KO). Best-effort : sans
+  # PAT, on s'en remet au rejoin automatique côté invité.
+  if PAT=$(grep '^SUPABASE_PAT=' "$HOME/.zmeo-supabase.env" 2>/dev/null | cut -d= -f2- | tr -d '"'); [ -n "$PAT" ]; then
+    curl -sS -m 20 -X POST "https://api.supabase.com/v1/projects/wwutjnqchxzdfxmhfaaj/database/query" \
+      -H "Authorization: Bearer $PAT" -H "Content-Type: application/json" \
+      -d '{"query":"delete from public.online_rooms where code = '"'"'QATE'"'"'"}' >/dev/null 2>&1 \
+      && log "salon QATE purgé" || log "purge QATE impossible (on continue)"
+  fi
   log "duel : hôte (bakarat-host) + guest (bakarat-guest, +8s)"
   xcrun simctl bootstatus "$GUEST_ID" -b >/dev/null 2>&1 || true
   sleep 30   # sim guest chaud avant de lancer les deux runners

@@ -349,7 +349,7 @@ struct OnlineLobbyView: View {
     }
 
     @ViewBuilder
-    private func readOnlyRow(label: String, value: String) -> some View {
+    private func readOnlyRow(label: LocalizedStringKey, value: String) -> some View {
         HStack {
             Text(label)
             Spacer()

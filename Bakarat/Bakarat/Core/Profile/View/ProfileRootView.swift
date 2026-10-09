@@ -20,6 +20,8 @@ struct ProfileRootView: View {
 
     @State private var photoItem: PhotosPickerItem?
     @State private var showSignOutConfirm = false
+    @State private var showDeleteConfirm = false
+    @State private var deleteError: String?
 
     // Avatar cropper flow
     @State private var pickedImage: UIImage? = nil
@@ -62,6 +64,22 @@ struct ProfileRootView: View {
                     Task { await auth.signOut() }
                 }
                 Button("Cancel", role: .cancel) { }
+            }
+            .confirmationDialog("Delete my account?", isPresented: $showDeleteConfirm, titleVisibility: .visible) {
+                Button("Delete everything", role: .destructive) {
+                    Task {
+                        do { try await auth.deleteAccount() }
+                        catch { deleteError = error.localizedDescription }
+                    }
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("Your account, your games, your balances and your photo are deleted immediately. This cannot be undone.")
+            }
+            .alert("Deletion failed", isPresented: Binding(get: { deleteError != nil }, set: { if !$0 { deleteError = nil } })) {
+                Button("OK", role: .cancel) { deleteError = nil }
+            } message: {
+                Text(deleteError ?? "")
             }
             .alert("Edit username", isPresented: $showEditName) {
                 TextField("Username", text: $editedName)
@@ -260,6 +278,17 @@ struct ProfileRootView: View {
             ) {
                 showSignOutConfirm = true
             }
+            settingsRow(
+                icon: "trash",
+                iconColor: Theme.systemRed,
+                title: "Delete my account",
+                subtitle: "Erases your data permanently",
+                accessory: .none,
+                titleColor: Theme.systemRed
+            ) {
+                showDeleteConfirm = true
+            }
+            .accessibilityIdentifier("profile.deleteAccount")
         }
     }
 
@@ -276,13 +305,13 @@ struct ProfileRootView: View {
 
     @ViewBuilder
     private func settingsCard<Content: View>(
-        header: String? = nil,
-        footer: String? = nil,
+        header: LocalizedStringKey? = nil,
+        footer: LocalizedStringKey? = nil,
         @ViewBuilder _ content: () -> Content
     ) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             if let header {
-                Text(header.uppercased())
+                Text(header).textCase(.uppercase)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(.secondary)
                     .tracking(0.5)
@@ -310,8 +339,8 @@ struct ProfileRootView: View {
     private func settingsRow(
         icon: String,
         iconColor: Color,
-        title: String,
-        subtitle: String? = nil,
+        title: LocalizedStringKey,
+        subtitle: LocalizedStringKey? = nil,
         accessory: RowAccessory = .chevron,
         titleColor: Color = .primary,
         action: @escaping () -> Void
@@ -335,8 +364,8 @@ struct ProfileRootView: View {
     private func settingsRowContent(
         icon: String,
         iconColor: Color,
-        title: String,
-        subtitle: String? = nil,
+        title: LocalizedStringKey,
+        subtitle: LocalizedStringKey? = nil,
         accessory: RowAccessory = .chevron,
         titleColor: Color = .primary
     ) -> some View {

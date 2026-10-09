@@ -405,7 +405,7 @@ struct CounterHistoryView: View {
     // MARK: - Section header
 
     @ViewBuilder
-    private func sectionHeader(icon: String, title: String, color: Color) -> some View {
+    private func sectionHeader(icon: String, title: LocalizedStringKey, color: Color) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
                 .font(.caption.weight(.bold))
@@ -566,7 +566,7 @@ struct CounterMancheDetailView: View {
     }
 
     @ViewBuilder
-    private func boardBlock(label: String,
+    private func boardBlock(label: LocalizedStringKey,
                             winners: Binding<Set<Int>>,
                             multi: Binding<CounterMulti>,
                             allowedSeats: Set<Int>?,

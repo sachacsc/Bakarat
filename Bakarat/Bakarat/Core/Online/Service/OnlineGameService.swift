@@ -41,6 +41,9 @@ final class OnlineGameService: ObservableObject {
     @Published private(set) var hostDisplayName: String?
     /// Vrai pendant une resynchronisation (retour au premier plan, réseau revenu).
     @Published private(set) var isReconnecting: Bool = false
+    /// Dernière reconnexion réussie (retour au premier plan, rejoin) : la vue
+    /// affiche « Reconnecté » quelques secondes (C-0005).
+    @Published private(set) var lastReconnectedAt: Date?
     /// Décalage horloge locale → serveur (secondes). `Date() + offset ≈ now()`.
     @Published private(set) var serverTimeOffset: TimeInterval = 0
     /// Code du salon en cours d'ouverture (loader lobby).
@@ -116,6 +119,61 @@ final class OnlineGameService: ObservableObject {
             guard let self else { return }
             Task { await self.handleHeartbeat(hb) }
         }
+        self.transport.onMembershipLost = { [weak self] in
+            guard let self else { return }
+            Task { await self.rejoinAfterMembershipLost() }
+        }
+        self.transport.onRoomGone = { [weak self] error in
+            guard let self else { return }
+            Task { await self.closeBecauseRoomGone(error) }
+        }
+    }
+
+    // MARK: - Salon perdu côté serveur
+
+    private var isRejoining = false
+
+    /// NOT_MEMBER au poll : le salon a été recréé (même code) ou purgé puis
+    /// recréé. On refait `join` : si le salon est en lobby on y retrouve un
+    /// siège ; en partie on devient spectateur jusqu'à la manche suivante.
+    private func rejoinAfterMembershipLost() async {
+        guard !isRejoining, room != nil else { return }
+        let name = myDisplayName
+        isRejoining = true
+        defer { isRejoining = false }
+        log("plus membre du salon — nouvelle tentative de join")
+        isReconnecting = true
+        defer { isReconnecting = false }
+        hostDriverTask?.cancel(); hostDriverTask = nil
+        role = .guest
+        version = 0
+        recordedManches = []
+        do {
+            let env = try await transport.rejoin(displayName: name)
+            applyEnvelope(env)
+            phase = (room?.status == .playing) ? .playing : .lobby
+            lastReconnectedAt = Date()
+            log("rejoint le salon (v\(env.version))")
+        } catch {
+            let mapped = RoomError.from(error)
+            switch mapped {
+            case .roomNotFound, .roomFinished:
+                await closeBecauseRoomGone(mapped)
+            default:
+                log("rejoin: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Le salon n'existe plus : on ferme avec un message clair plutôt que de
+    /// laisser l'écran figé sur un état fantôme.
+    private func closeBecauseRoomGone(_ error: RoomError) async {
+        guard room != nil else { return }
+        log("salon disparu (\(error)) — fermeture")
+        await leave()
+        lastError = (error == .roomFinished)
+            ? "Cette partie est terminée."
+            : "Le salon a été fermé par l'hôte."
     }
 
     // MARK: - Logging
@@ -294,6 +352,9 @@ final class OnlineGameService: ObservableObject {
         pendingChannelCode = nil
         role = nil
         room = nil
+        members = []
+        version = 0
+        recordedManches = []
         await transport.close()
     }
 
@@ -327,7 +388,15 @@ final class OnlineGameService: ObservableObject {
         guard room != nil else { return }
         isReconnecting = true
         await transport.resync()
+        // Le snapshot de resync arrive par le flux (asynchrone) : on applique
+        // tout de suite la dernière enveloppe pour relancer le tempo avec le
+        // rôle que le serveur nous reconnaît, pas celui d'avant l'absence.
+        if let env = transport.latest {
+            applyEnvelope(env)
+            applyRoleFromServer(hostUserId: env.hostUserId)
+        }
         isReconnecting = false
+        lastReconnectedAt = Date()
         if role == .host { resumeFromCurrentPhase() }
     }
 
@@ -438,10 +507,11 @@ final class OnlineGameService: ObservableObject {
         let connectedIds = Set(connectedMemberIds())
         let seatByUser: [UUID: Int]
         if let gs = room.gameState {
-            seatByUser = Dictionary(uniqueKeysWithValues: gs.players.map { ($0.userId, $0.seat) })
+            seatByUser = Dictionary(gs.players.map { ($0.userId, $0.seat) }, uniquingKeysWith: { a, _ in a })
         } else {
-            seatByUser = Dictionary(uniqueKeysWithValues:
-                room.participants.enumerated().map { ($0.element.userId, $0.offset) })
+            seatByUser = Dictionary(
+                room.participants.enumerated().map { ($0.element.userId, $0.offset) },
+                uniquingKeysWith: { a, _ in a })
         }
         let candidates = seatByUser
             .filter { connectedIds.contains($0.key) }
@@ -640,12 +710,12 @@ final class OnlineGameService: ObservableObject {
         }
 
         // Carry-over des scores.
-        let oldScores = Dictionary(uniqueKeysWithValues: gs.players.map { ($0.seat, $0.score) })
+        let oldScores = Dictionary(gs.players.map { ($0.seat, $0.score) }, uniquingKeysWith: { a, _ in a })
         for i in 0..<newState.players.count {
             newState.players[i].score = oldScores[newState.players[i].seat] ?? 0
         }
         newState.initialScores = Dictionary(
-            uniqueKeysWithValues: newState.players.map { ($0.seat, $0.score) }
+            newState.players.map { ($0.seat, $0.score) }, uniquingKeysWith: { a, _ in a }
         )
 
         let targetManche = newState.mancheNumber
@@ -1477,8 +1547,15 @@ final class OnlineGameService: ObservableObject {
             } catch {
                 log("record_manche échec \(attempt)/3 : \(error.localizedDescription)")
                 if attempt == 3 {
-                    // On laisse la manche retentable par le prochain hôte.
-                    recordedManches.remove(gs.mancheNumber)
+                    // On laisse la manche retentable (par moi dans 20 s, ou
+                    // par le prochain hôte tout de suite : son Set est vide et
+                    // record_manche est idempotent). Retirer immédiatement
+                    // ferait repartir 3 RPC toutes les 0,4 s via le driver.
+                    let manche = gs.mancheNumber
+                    Task { [weak self] in
+                        try? await Task.sleep(nanoseconds: 20_000_000_000)
+                        await MainActor.run { self?.recordedManches.remove(manche) }
+                    }
                     return
                 }
                 try? await Task.sleep(nanoseconds: delay)
@@ -1631,7 +1708,7 @@ final class OnlineGameService: ObservableObject {
             tiebreakBoards: []
         )
         state.initialScores = Dictionary(
-            uniqueKeysWithValues: players.map { ($0.seat, $0.score) }
+            players.map { ($0.seat, $0.score) }, uniquingKeysWith: { a, _ in a }
         )
         return state
     }

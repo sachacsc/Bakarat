@@ -99,7 +99,7 @@ final class BakaratDuelHostUITests: DuelUITestCase {
         // c'est là que la coupure fait le plus mal. Avec chrono, le libellé
         // d'annonce est « BN · 27s » (pas « Annonces ») → `isAnnouncingAny`.
         _ = waitFor(90) {
-            self.isAnnouncingAny || self.phaseLabel.contains("Reveal")
+            self.isAnnouncingAny || (self.phaseLabel.contains("Reveal") || self.phaseLabel.contains("Révélation"))
         }
         shot("08-avant-absence-hote")
         let phaseBefore = phaseLabel

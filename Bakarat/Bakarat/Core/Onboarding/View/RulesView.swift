@@ -278,16 +278,22 @@ struct RulesView: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
-    private func bullet(_ text: String) -> some View {
+    /// Markdown inline (gras, code) sur une chaîne déjà localisée.
+    private static func inlineMarkdown(_ s: String) -> AttributedString {
+        (try? AttributedString(markdown: s, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(s)
+    }
+
+    private func bullet(_ text: String.LocalizationValue) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text("•").font(.subheadline).foregroundStyle(.secondary)
-            Text(try! AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            Text(Self.inlineMarkdown(String(localized: text)))
                 .font(.subheadline)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
 
-    private func tableRow(_ label: String, _ value: String, isHeader: Bool) -> some View {
+    private func tableRow(_ label: LocalizedStringKey, _ value: LocalizedStringKey, isHeader: Bool) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Text(label)
                 .font(isHeader ? .caption.weight(.bold) : .caption)
@@ -301,7 +307,7 @@ struct RulesView: View {
         .padding(.vertical, 6)
     }
 
-    private func phaseBlock(number: String, title: String, body: String) -> some View {
+    private func phaseBlock(number: String, title: LocalizedStringKey, body: String.LocalizationValue) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Text(number)
                 .font(.headline.weight(.bold))
@@ -310,7 +316,7 @@ struct RulesView: View {
                 .background(Circle().fill(Theme.brandRed))
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.subheadline.weight(.semibold))
-                Text(try! AttributedString(markdown: body, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+                Text(Self.inlineMarkdown(String(localized: body)))
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -326,7 +332,7 @@ struct RulesView: View {
         }
     }
 
-    private func multiRow(label: String, multi: String, desc: String) -> some View {
+    private func multiRow(label: LocalizedStringKey, multi: String, desc: LocalizedStringKey) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Text(multi)
                 .font(.caption.weight(.bold))

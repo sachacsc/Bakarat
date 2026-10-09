@@ -233,6 +233,17 @@ final class AuthService: ObservableObject {
         }
     }
 
+    /// Supprime définitivement le compte courant (RPC `delete_my_account`,
+    /// SECURITY DEFINER : auth.users + cascade + avatars). Exigé par la
+    /// guideline App Store 5.1.1 (v). Après succès, la session locale est
+    /// purgée : le user n'existe plus, signOut distant renverrait 403.
+    func deleteAccount() async throws {
+        isLoading = true
+        defer { isLoading = false }
+        try await client.rpc("delete_my_account").execute()
+        try? await client.auth.signOut(scope: .local)
+    }
+
     func sendPasswordReset(email: String) async throws {
         try await client.auth.resetPasswordForEmail(
             email,

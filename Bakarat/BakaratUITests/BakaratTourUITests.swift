@@ -89,6 +89,7 @@ final class BakaratTourUITests: XCTestCase {
             "-qaBots", "2",
             "-qaPassword", qaPassword,
             "-autoStartAt", "3", "-autoStartDelay", "8",
+            "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR",
         ]
         addUIInterruptionMonitor(withDescription: "alerte système") { alert in
             for label in ["Allow While Using App", "Allow", "OK", "Autoriser", "Don’t Allow", "Don't Allow"] {
@@ -508,11 +509,13 @@ final class BakaratTourUITests: XCTestCase {
         // pas là, l'assertion d'expérience est déjà tenue par construction :
         // il n'existe aucun chemin implicite vers « Quitter ».)
         let tabBar = app.tabBars.firstMatch
-        if tabBar.exists && tabBar.buttons["Accounts"].exists {
-            tabBar.buttons["Accounts"].tap()
+        let accountsTab = tabBar.buttons.matching(NSPredicate(format: "label IN {'Accounts', 'Comptes'}")).firstMatch
+        let playTab = tabBar.buttons.matching(NSPredicate(format: "label IN {'Play', 'Jouer'}")).firstMatch
+        if tabBar.exists && accountsTab.exists {
+            accountsTab.tap()
             settle(1.5)
             shot("13-onglet-comptes")
-            tabBar.buttons["Play"].tap()
+            playTab.tap()
             settle(2)
             shot("13-retour-partie")
             XCTAssertTrue(element("game.root").waitForExistence(timeout: 15),
@@ -691,7 +694,7 @@ final class BakaratTourUITests: XCTestCase {
         // Board 1 et 2 → le board suivant repasse en annonces (le panneau
         // redevient vierge) ; board 3 → fin de manche.
         let revealed = waitFor(Wait.reveal) {
-            self.phaseLabel.contains("Reveal") || self.isPast(board: board)
+            (self.phaseLabel.contains("Reveal") || self.phaseLabel.contains("Révélation")) || self.isPast(board: board)
         }
         if !revealed {
             diag("\(pad(step))-DIAG-reveal-b\(board)")

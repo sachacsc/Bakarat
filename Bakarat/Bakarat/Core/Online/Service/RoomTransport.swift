@@ -177,6 +177,7 @@ enum RoomError: Error, Equatable, Sendable {
     case badSubmission
     case roomFinished
     case codeTaken
+    case roomFull
     case badCode
     case badState
     case badStatus
@@ -213,6 +214,7 @@ enum RoomError: Error, Equatable, Sendable {
         if upper.contains("BAD_SUBMISSION") { return .badSubmission }
         if upper.contains("ROOM_FINISHED") { return .roomFinished }
         if upper.contains("CODE_TAKEN") { return .codeTaken }
+        if upper.contains("ROOM_FULL") { return .roomFull }
         if upper.contains("CODE_EXHAUSTED") { return .codeExhausted }
         if upper.contains("BAD_CODE") { return .badCode }
         if upper.contains("BAD_STATE") { return .badState }
@@ -236,6 +238,7 @@ enum RoomError: Error, Equatable, Sendable {
         case .badSubmission:    return "Annonce invalide."
         case .roomFinished:     return "Cette partie est terminée."
         case .codeTaken:        return "Ce code de salon est déjà pris."
+        case .roomFull:         return "Ce salon est complet (8 joueurs max)."
         case .badCode:          return "Code de salon invalide."
         case .badState:         return "État de partie invalide."
         case .badStatus:        return "Statut de partie invalide."
@@ -344,6 +347,14 @@ final class RoomTransport: ObservableObject {
     /// Appelé à chaque `room_heartbeat` réussi (poll). Sert au bail d'hôte et à
     /// la présence côté service.
     var onHeartbeat: ((RoomHeartbeat) -> Void)?
+    /// Le serveur ne me connaît plus comme membre (salon recréé par l'hôte,
+    /// purge…) : le service doit refaire `join` — sans ça l'écran reste figé
+    /// sur le dernier état local (C-0002/0003/0004).
+    var onMembershipLost: (() -> Void)?
+    /// Le salon n'existe plus / est terminé, de façon persistante (3 polls
+    /// consécutifs) : le service doit fermer proprement.
+    var onRoomGone: ((RoomError) -> Void)?
+    private var consecutiveRoomGone = 0
 
     // MARK: Configuration
 
@@ -798,7 +809,34 @@ final class RoomTransport: ObservableObject {
         } catch {
             // Erreur déjà journalisée par rpcRaw. Le poll continue.
             if connectionState == .connected { connectionState = .reconnecting }
+            switch RoomError.from(error) {
+            case .notMember:
+                consecutiveRoomGone = 0
+                note("membership_lost", detail: code)
+                onMembershipLost?()
+            case .roomNotFound, .roomFinished:
+                consecutiveRoomGone += 1
+                if consecutiveRoomGone >= 3 {
+                    consecutiveRoomGone = 0
+                    note("room_gone", detail: code)
+                    onRoomGone?(RoomError.from(error))
+                }
+            default:
+                break
+            }
+            return
         }
+        consecutiveRoomGone = 0
+    }
+
+    /// Refait `room_join` sur le salon courant en repartant de zéro côté
+    /// versions : si l'hôte a recréé le salon, sa version repart à 1 et les
+    /// gardes « version strictement croissante » l'ignoreraient.
+    func rejoin(displayName: String) async throws -> RoomEnvelope {
+        guard let code else { throw RoomError.roomNotFound }
+        lastEmittedVersion = 0
+        latest = nil
+        return try await join(code: code, displayName: displayName)
     }
 
     // MARK: - État de connexion

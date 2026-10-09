@@ -168,7 +168,7 @@ struct OnboardingView: View {
         }
     }
 
-    private func modeCard(icon: String, title: String, body: String) -> some View {
+    private func modeCard(icon: String, title: LocalizedStringKey, body: LocalizedStringKey) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Image(systemName: icon)
                 .font(.title2)

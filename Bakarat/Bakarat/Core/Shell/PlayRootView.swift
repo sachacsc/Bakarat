@@ -214,7 +214,7 @@ struct PlayRootView: View {
     // MARK: - Action row (CTA réutilisé pour les deux sections)
 
     @ViewBuilder
-    private func actionRow(title: String, subtitle: String, icon: String, tint: Color, primary: Bool) -> some View {
+    private func actionRow(title: LocalizedStringKey, subtitle: LocalizedStringKey, icon: String, tint: Color, primary: Bool) -> some View {
         HStack(spacing: 14) {
             Image(systemName: icon)
                 .font(.system(size: 26, weight: .bold))

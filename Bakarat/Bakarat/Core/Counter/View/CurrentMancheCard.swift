@@ -112,7 +112,7 @@ struct CurrentMancheCard: View {
     // MARK: - Boards
 
     @ViewBuilder
-    private func boardBlock(label: String,
+    private func boardBlock(label: LocalizedStringKey,
                             winners: Binding<Set<Int>>,
                             multi: Binding<CounterMulti>,
                             allowedSeats: Set<Int>?,

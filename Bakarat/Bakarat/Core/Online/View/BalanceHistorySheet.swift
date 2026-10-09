@@ -463,7 +463,7 @@ struct BalanceHistorySheet: View {
     // MARK: - Section header style commun
 
     @ViewBuilder
-    private func sectionHeader(icon: String, title: String, color: Color) -> some View {
+    private func sectionHeader(icon: String, title: LocalizedStringKey, color: Color) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon)
                 .font(.caption.weight(.bold))
@@ -626,7 +626,7 @@ struct MancheDetailView: View {
     }
 
     @ViewBuilder
-    private func boardBlock(label: String, board: Binding<OnlineBoardEdit>) -> some View {
+    private func boardBlock(label: LocalizedStringKey, board: Binding<OnlineBoardEdit>) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(label)
                 .font(.subheadline.weight(.semibold))

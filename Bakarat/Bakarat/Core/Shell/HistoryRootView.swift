@@ -188,7 +188,7 @@ struct HistoryRootView: View {
         }
     }
 
-    private func chip(title: String, amount: Double, color: Color, icon: String) -> some View {
+    private func chip(title: LocalizedStringKey, amount: Double, color: Color, icon: String) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Image(systemName: icon).font(.system(size: 13, weight: .semibold))

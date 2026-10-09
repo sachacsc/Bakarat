@@ -21,6 +21,7 @@
 
 import Foundation
 import Testing
+import Supabase
 @testable import Bakarat
 
 @MainActor
@@ -287,6 +288,73 @@ struct OnlineProtocolLiveTests {
         #expect(revived.room?.hostUserId == t.guest.userId)
 
         await LiveFixtures.cleanup([revived, t.guestService, t.hostService], tasks: [guestPlay])
+    }
+
+    // MARK: - 4b · Le comptage survit à la relève d'hôte
+
+    /// Nombre de manches enregistrées côté cloud pour une `games` (RLS :
+    /// visible par tout participant via `my_game_ids`).
+    private static func mancheCount(_ client: SupabaseClient, gameId: UUID) async -> Int {
+        struct Row: Decodable { let manche_number: Int }
+        let rows: [Row] = (try? await client.from("manches")
+            .select("manche_number")
+            .eq("game_id", value: gameId.uuidString)
+            .execute().value) ?? []
+        return rows.count
+    }
+
+    private static func waitForMancheCount(_ client: SupabaseClient, gameId: UUID,
+                                           _ expected: Int, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await mancheCount(client, gameId: gameId) >= expected { return true }
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
+        return false
+    }
+
+    @Test("recordAfterHandoff : la manche jouée sous le nouvel hôte est comptée (record_manche par un participant)")
+    func recordAfterHandoff() async throws {
+        let t = try await Self.openTable()
+        let started = await Self.start(t)
+        #expect(started)
+
+        let hostPlay = LiveFixtures.autoplay(t.hostService, userId: t.host.userId)
+        let guestPlay = LiveFixtures.autoplay(t.guestService, userId: t.guest.userId)
+
+        let ended = await LiveFixtures.waitUntil(timeout: 120) {
+            t.hostService.room?.gameState?.phase == .mancheEnd
+        }
+        #expect(ended, "manche 1 jouée sous l'hôte d'origine")
+        guard let gameId = t.hostService.room?.cloudGameId else {
+            Issue.record("pas de cloudGameId après la manche 1 (ensure_game_and_participants)")
+            await LiveFixtures.cleanup([t.guestService, t.hostService], tasks: [hostPlay, guestPlay])
+            return
+        }
+        let first = await Self.waitForMancheCount(t.guest.client, gameId: gameId, 1, timeout: 40)
+        #expect(first, "manche 1 enregistrée par l'hôte d'origine")
+
+        // L'hôte meurt sans `room_leave` ; l'invité reprend le bail.
+        hostPlay.cancel()
+        await t.hostService.transport.close()
+        let promoted = await LiveFixtures.waitUntil(timeout: 45) { t.guestService.role == .host }
+        #expect(promoted, "l'invité anime après expiration du bail")
+
+        // Le nouvel hôte lance la manche 2 et la joue seul (l'ex-hôte est muet :
+        // il passera en forfait après 60 s de silence s'il bloque).
+        await t.guestService.startNextManche()
+        let ended2 = await LiveFixtures.waitUntil(timeout: 240) {
+            guard let gs = t.guestService.room?.gameState else { return false }
+            return gs.mancheNumber == 2 && gs.phase == .mancheEnd
+        }
+        #expect(ended2, "manche 2 jouée jusqu'au bout sous le nouvel hôte")
+
+        // Le point clé : record_manche doit accepter un PARTICIPANT, pas
+        // seulement l'owner de la `games` (migration 20261009190000).
+        let second = await Self.waitForMancheCount(t.guest.client, gameId: gameId, 2, timeout: 60)
+        #expect(second, "manche 2 enregistrée par le nouvel hôte (participant, pas owner)")
+
+        await LiveFixtures.cleanup([t.guestService, t.hostService], tasks: [guestPlay])
     }
 
     // MARK: - 5 · Fusion des annonces (l'hôte n'efface jamais un invité)

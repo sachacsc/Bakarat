@@ -98,7 +98,7 @@ struct EditOnlineMancheSheet: View {
     }
 
     @ViewBuilder
-    private func boardBlock(label: String, board: Binding<OnlineBoardEdit>) -> some View {
+    private func boardBlock(label: LocalizedStringKey, board: Binding<OnlineBoardEdit>) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(label)
                 .font(.subheadline.weight(.semibold))

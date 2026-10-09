@@ -506,7 +506,7 @@ struct CloudSessionDetailView: View {
     // MARK: - Section header
 
     @ViewBuilder
-    private func sectionHeader(icon: String, title: String, color: Color) -> some View {
+    private func sectionHeader(icon: String, title: LocalizedStringKey, color: Color) -> some View {
         HStack(spacing: 6) {
             Image(systemName: icon).font(.caption.weight(.bold))
             Text(title)
@@ -793,7 +793,7 @@ struct CloudMancheDetailView: View {
     }
 
     @ViewBuilder
-    private func boardBlock(label: String, board: Binding<OnlineBoardEdit>) -> some View {
+    private func boardBlock(label: LocalizedStringKey, board: Binding<OnlineBoardEdit>) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(label).font(.subheadline.weight(.semibold))
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 8),

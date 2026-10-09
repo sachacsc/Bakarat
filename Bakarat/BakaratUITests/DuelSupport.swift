@@ -81,6 +81,9 @@ class DuelUITestCase: XCTestCase {
             "-autoLoginEmail", email,
             "-autoLoginPassword", qaPassword,
             "-qaPassword", qaPassword,
+            // Les prédicats du tour/duel lisent les libellés français ; l'app
+            // est désormais localisée dans les deux sens, on fige la langue.
+            "-AppleLanguages", "(fr)", "-AppleLocale", "fr_FR",
         ] + extra
         addUIInterruptionMonitor(withDescription: "alerte système") { alert in
             for label in ["Allow While Using App", "Allow", "OK", "Autoriser", "Don’t Allow", "Don't Allow"] {
